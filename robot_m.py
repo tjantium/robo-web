@@ -11,16 +11,34 @@ class RobotMessage:
         self.linear_point = linear_point # The pose used for linearization
 
 class RobotAgent:
-    def __init__(self, name, initial_mu):
+    """Base robot agent with GPB localization capabilities."""
+    def __init__(self, name, initial_mu, robot_type='differential'):
         self.id = str(uuid4())[:8]
         self.name = name
-        self.mu = initial_mu
+        self.mu = initial_mu  # Estimated position [x, y]
+        self.robot_type = robot_type  # 'differential' or 'car_like'
         self.inbox = {}  # Stores latest messages from neighbors
         self.odometry_buffer = []  # Store odometry measurements (motion model)
         self.last_position = initial_mu.copy()  # For odometry
         self.is_active = True  # For dynamic join/leave
         self.message_queue = []  # For asynchronous communication
         self.last_message_time = {}  # Track message timestamps for async
+        
+        # Robot kinematics
+        self.radius = 0.5  # Robot radius for collision avoidance
+        self.angle = 0.0  # Orientation (for differential and car-like)
+        
+        # Differential drive specific
+        if robot_type == 'differential':
+            self.linear_vel = 0.0
+            self.angular_vel = 0.0
+        
+        # Car-like specific
+        if robot_type == 'car_like':
+            self.steering_angle = 0.0  # Steering angle
+            self.wheelbase = 1.0  # Distance between front and rear axles
+            self.max_steering = np.pi / 6  # Max steering angle (30 degrees)
+            self.velocity = 0.0  # Forward velocity
         
     def get_local_message(self, neighbor_mu, measurement, noise_std, is_robust=False):
         """
@@ -78,3 +96,37 @@ class RobotAgent:
         
         # Call our static solver
         self.mu, _ = GBPSolver.update_variable(etas, lambdas)
+    
+    def update_kinematics(self, dt):
+        """Update robot position based on kinematics."""
+        if self.robot_type == 'differential':
+            # Differential drive kinematics
+            if abs(self.angular_vel) > 1e-6:
+                # Arc motion
+                radius = self.linear_vel / (self.angular_vel + 1e-6)
+                dtheta = self.angular_vel * dt
+                dx = radius * (np.sin(self.angle + dtheta) - np.sin(self.angle))
+                dy = radius * (-np.cos(self.angle + dtheta) + np.cos(self.angle))
+            else:
+                # Straight motion
+                dx = self.linear_vel * np.cos(self.angle) * dt
+                dy = self.linear_vel * np.sin(self.angle) * dt
+            
+            self.mu += np.array([dx, dy])
+            self.angle += self.angular_vel * dt
+            
+        elif self.robot_type == 'car_like':
+            # Car-like (bicycle) kinematics
+            if abs(self.steering_angle) > 1e-6:
+                # Turning motion
+                turning_radius = self.wheelbase / np.tan(self.steering_angle)
+                dtheta = (self.velocity / turning_radius) * dt
+                dx = turning_radius * (np.sin(self.angle + dtheta) - np.sin(self.angle))
+                dy = turning_radius * (-np.cos(self.angle + dtheta) + np.cos(self.angle))
+            else:
+                # Straight motion
+                dx = self.velocity * np.cos(self.angle) * dt
+                dy = self.velocity * np.sin(self.angle) * dt
+            
+            self.mu += np.array([dx, dy])
+            self.angle += (self.velocity / self.wheelbase) * np.tan(self.steering_angle) * dt

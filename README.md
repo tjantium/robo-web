@@ -69,6 +69,141 @@ Real-time statistics including:
 - Position estimation errors
 - Convergence metrics
 
+## What This Demo Shows
+
+This simulation demonstrates a multi-robot system where **differential drive robots** (like Roomba vacuums) navigate together using:
+1. **RVO (Reciprocal Velocity Obstacles)** for collision avoidance
+2. **GPB (Gaussian Belief Propagation)** for distributed localization
+
+### The Scenario
+
+**Robot Type: Differential Drive Robots (Roomba-like)**
+
+The simulation uses **differential drive robots**, which are the most common type of mobile robots (like Roomba vacuum cleaners, TurtleBot, etc.). These robots have:
+
+- **Two independently driven wheels** (left and right)
+- **Can rotate in place** (zero turning radius) by spinning wheels in opposite directions
+- **Holonomic-like motion** - can move in any direction by combining forward/backward motion with rotation
+- **Simple controls**: Linear velocity (forward/backward speed) and angular velocity (rotation rate)
+
+**Why Differential Drive?**
+- Most common and practical robot design
+- Simple to control and model
+- Good for indoor navigation
+- Allows for precise positioning and turning
+
+**The Setup:**
+
+- **4 differential drive robots** start positioned in a circle formation
+- Robots move in **circular patterns** (some clockwise, some counter-clockwise) to create interesting interactions
+- **3 moving obstacles** are randomly placed - robots must navigate around them
+- **1 fixed landmark** serves as a reference point for localization
+- All within a **circular boundary** (radius ~20 units)
+
+**What Happens:**
+
+1. **Motion**: Each robot follows a circular path while using RVO to avoid collisions
+2. **Observation**: Robots observe each other when within sensor range (detect distance and angle)
+3. **Communication**: Robots exchange GPB messages to share position information
+4. **Localization**: Each robot estimates its own position using:
+   - Its own motion (odometry)
+   - Observations of nearby robots
+   - Observations of the landmark (if in range)
+5. **Robustness**: System handles communication failures (packet loss, delays) gracefully
+
+- **4 differential drive robots** move in circular patterns within a bounded area
+- Robots use **RVO** to avoid collisions with each other and obstacles
+- Robots **observe each other** and exchange **GPB messages** to improve their position estimates
+- The system handles **unreliable communication** (packet loss, delays) through message queues
+- A **GPB performance plot** shows how well the localization algorithm is working
+
+### Visual Legend - What You See on Screen
+
+**Main Simulation Plot (Top):**
+
+- **Colored Circles with Arrows**: The robots themselves
+  - Each robot has a unique color (Robot 1, Robot 2, etc.)
+  - The arrow shows the robot's current orientation/direction
+  
+- **Colored Lines (Trails)**: Robot paths showing where they've been
+  - Each robot's path is shown in its color
+  - Helps visualize movement patterns
+
+- **Green Solid Lines**: **Inter-robot Communication**
+  - Connects robots that are within sensor range of each other
+  - Shows which robots can exchange GPB messages
+  - Arrows indicate communication direction
+  - These lines appear/disappear as robots move in/out of range
+
+- **Red Dashed Lines**: **Range-Bearing Measurements**
+  - Connect robots to landmarks
+  - Show sensor observations (distance and angle measurements)
+  - Only visible when robots are within sensor range of landmarks
+
+- **Gray Dashed Circle**: **Sensor Range**
+  - Shows the detection/communication range around a robot
+  - Robots can only communicate if they're within each other's sensor range
+
+- **Black Square with "L1"**: **Landmark**
+  - Fixed reference point that robots can observe
+  - Helps with localization
+
+- **Red Filled Circles**: **Obstacles**
+  - Moving obstacles that robots must avoid using RVO
+  - Robots navigate around them
+
+- **Pink Dashed Circle**: **Boundary**
+  - The outer limit of the simulation area
+  - Robots stay within this boundary
+
+- **Yellow "Q:X" Indicators**: **Message Queue**
+  - Shows robots with queued messages (delayed/dropped messages waiting to be delivered)
+  - Appears when communication is unreliable (packet loss, delays)
+  - The number shows how many messages are queued
+
+**GPB Performance Plot (Bottom):**
+
+- **Blue Line**: Average position error over time
+  - Shows how accurate the robots' position estimates are
+  - Lower is better
+  - Should decrease over time as GPB converges
+
+- **"Current Error"**: The most recent average position error value
+
+- **"Converging ✓" or "Diverging ✗"**: Status indicator
+  - Shows whether the GPB algorithm is improving (converging) or getting worse (diverging)
+
+### What's Being Demonstrated
+
+1. **Distributed Localization**: Each robot estimates its own position using:
+   - Its own motion (odometry)
+   - Observations of nearby robots (inter-robot communication)
+   - Observations of landmarks (if available)
+   - All combined using Gaussian Belief Propagation
+
+2. **Collision Avoidance**: Robots use RVO to:
+   - Avoid collisions with other robots
+   - Navigate around obstacles
+   - Maintain safe distances while moving
+
+3. **Robust Communication**: The system handles:
+   - **Packet loss** (simulated WiFi cutoffs) - messages get dropped
+   - **Message delays** - messages arrive late
+   - **Message queues** - dropped/delayed messages are queued and retried
+   - Robots continue to function even when communication is unreliable
+
+4. **Real-time Performance Monitoring**: The GPB plot shows:
+   - How well the localization is working
+   - Whether the algorithm is converging (getting better) or diverging (getting worse)
+   - Error trends over time
+
+### Key Settings to Try
+
+- **Increase Packet Loss** (10% → 50%): See how robots handle communication failures
+- **Adjust Sensor Range**: See how communication changes as robots move in/out of range
+- **Watch the GPB Plot**: Observe how position errors change as robots exchange messages
+- **Check Message Queues**: Look for yellow "Q:X" indicators when packet loss is high
+
 ## Technical Details
 
 ### Architecture
