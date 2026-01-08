@@ -85,7 +85,8 @@ class RobotWebGUI(QMainWindow):
         self.debug_console = True  # Print to console
         
         # GPB Performance Tracking
-        self.gpb_error_history = []  # Track position errors over time
+        self.gpb_error_history = []  # Track average position errors over time
+        self.gpb_robot_errors = {}  # Track individual robot errors {robot_id: [errors]}
         self.gpb_convergence_history = []  # Track convergence metrics
         self.gpb_message_history = []  # Track messages per iteration
         self.max_history_length = 500  # Keep last 500 data points
@@ -133,7 +134,7 @@ class RobotWebGUI(QMainWindow):
         # Main simulation plot - leave space on right for legend
         self.fig = plt.figure(figsize=(14, 10))  # Wider figure to accommodate legend
         gs = self.fig.add_gridspec(2, 1, height_ratios=[2, 1], hspace=0.3, 
-                                   left=0.08, right=0.72, top=0.95, bottom=0.05)
+                                   left=0.08, right=0.70, top=0.95, bottom=0.05)
         
         # Top: Main simulation canvas
         self.ax = self.fig.add_subplot(gs[0])
@@ -188,6 +189,10 @@ class RobotWebGUI(QMainWindow):
         self.robots = []
         self.robot_paths = {}
         self.robot_gt_paths = {}
+        # Clear error history when robots are reinitialized (new robots = new IDs)
+        self.gpb_robot_errors = {}
+        self.gpb_error_history = []
+        self.gpb_convergence_history = []
         
         # Initialize differential robots in a larger circle with better spacing
         for i in range(self.num_robots):
@@ -268,28 +273,78 @@ class RobotWebGUI(QMainWindow):
     def create_control_panel(self):
         """Create the left control panel with settings."""
         panel = QWidget()
-        panel.setMaximumWidth(300)
+        panel.setMaximumWidth(320)  # Slightly wider for better layout
         panel.setStyleSheet("background-color: #2b2b2b; color: white;")
         
-        layout = QVBoxLayout(panel)
+        # Main layout with scroll area
+        main_layout = QVBoxLayout(panel)
+        main_layout.setSpacing(5)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Create scroll area to prevent squeezing
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        
+        # Content widget for scroll area
+        content_widget = QWidget()
+        layout = QVBoxLayout(content_widget)
         layout.setSpacing(10)
+        layout.setContentsMargins(5, 5, 5, 5)
         
-        # Settings Group
+        # Settings Group - Collapsible
         settings_group = QGroupBox("▼ Settings")
-        settings_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        settings_group.setCheckable(True)
+        settings_group.setChecked(True)  # Start expanded
+        settings_group.setStyleSheet("""
+            QGroupBox { 
+                font-weight: bold; 
+                border: 2px solid #555;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
         settings_layout = QVBoxLayout()
+        settings_layout.setSpacing(8)
         
-        # Number of robots
+        # Sub-group: Robot Configuration
+        robot_config_group = QGroupBox("Robot Config")
+        robot_config_group.setCheckable(True)
+        robot_config_group.setChecked(True)
+        robot_config_group.setStyleSheet("""
+            QGroupBox { 
+                font-weight: bold; 
+                border: 1px solid #555;
+                border-radius: 3px;
+                margin-top: 5px;
+                padding-top: 5px;
+                font-size: 9pt;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 5px;
+                padding: 0 3px;
+            }
+        """)
+        robot_config_layout = QVBoxLayout()
+        robot_config_layout.setSpacing(5)
+        
         robots_layout = QHBoxLayout()
         robots_layout.addWidget(QLabel("Num Robots:"))
         self.num_robots_spin = QSpinBox()
-        self.num_robots_spin.setRange(2, 10)  # Reduced max for cleaner demo
+        self.num_robots_spin.setRange(2, 10)
         self.num_robots_spin.setValue(self.num_robots)
         self.num_robots_spin.valueChanged.connect(self.on_num_robots_changed)
         robots_layout.addWidget(self.num_robots_spin)
-        settings_layout.addLayout(robots_layout)
+        robot_config_layout.addLayout(robots_layout)
         
-        # Circle radius
         radius_layout = QHBoxLayout()
         radius_layout.addWidget(QLabel("Circle Radius:"))
         self.radius_spin = QDoubleSpinBox()
@@ -298,45 +353,36 @@ class RobotWebGUI(QMainWindow):
         self.radius_spin.setValue(self.circle_radius)
         self.radius_spin.valueChanged.connect(self.on_radius_changed)
         radius_layout.addWidget(self.radius_spin)
-        settings_layout.addLayout(radius_layout)
+        robot_config_layout.addLayout(radius_layout)
         
-        # Number of landmarks
-        landmarks_layout = QHBoxLayout()
-        landmarks_layout.addWidget(QLabel("Num Landmarks:"))
-        self.num_landmarks_spin = QSpinBox()
-        self.num_landmarks_spin.setRange(0, 10)
-        self.num_landmarks_spin.setValue(self.num_landmarks)
-        self.num_landmarks_spin.valueChanged.connect(self.on_num_landmarks_changed)
-        landmarks_layout.addWidget(self.num_landmarks_spin)
-        settings_layout.addLayout(landmarks_layout)
+        robot_config_group.setLayout(robot_config_layout)
+        def update_robot_config_arrow(checked):
+            robot_config_group.setTitle("▶ Robot Config" if not checked else "Robot Config")
+        robot_config_group.toggled.connect(update_robot_config_arrow)
+        settings_layout.addWidget(robot_config_group)
         
-        # Use landmark only
-        self.landmark_only_cb = QCheckBox("Use Landmark Only")
-        self.landmark_only_cb.setChecked(self.use_landmark_only)
-        self.landmark_only_cb.stateChanged.connect(self.on_landmark_only_changed)
-        settings_layout.addWidget(self.landmark_only_cb)
+        # Sub-group: Sensor & Communication
+        sensor_comm_group = QGroupBox("Sensor & Comm")
+        sensor_comm_group.setCheckable(True)
+        sensor_comm_group.setChecked(True)
+        sensor_comm_group.setStyleSheet("""
+            QGroupBox { 
+                font-weight: bold; 
+                border: 1px solid #555;
+                border-radius: 3px;
+                margin-top: 5px;
+                padding-top: 5px;
+                font-size: 9pt;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 5px;
+                padding: 0 3px;
+            }
+        """)
+        sensor_comm_layout = QVBoxLayout()
+        sensor_comm_layout.setSpacing(5)
         
-        # Iter before motion
-        iter_layout = QHBoxLayout()
-        iter_layout.addWidget(QLabel("Iter Before Mot:"))
-        self.iter_spin = QSpinBox()
-        self.iter_spin.setRange(1, 20)
-        self.iter_spin.setValue(self.iter_before_motion)
-        self.iter_spin.valueChanged.connect(self.on_iter_changed)
-        iter_layout.addWidget(self.iter_spin)
-        settings_layout.addLayout(iter_layout)
-        
-        # Linearize every
-        lin_layout = QHBoxLayout()
-        lin_layout.addWidget(QLabel("Linearize Every:"))
-        self.lin_spin = QSpinBox()
-        self.lin_spin.setRange(1, 10)
-        self.lin_spin.setValue(self.linearize_every)
-        self.lin_spin.valueChanged.connect(self.on_linearize_changed)
-        lin_layout.addWidget(self.lin_spin)
-        settings_layout.addLayout(lin_layout)
-        
-        # Sensor range
         sensor_layout = QHBoxLayout()
         sensor_layout.addWidget(QLabel("Sensor Range:"))
         self.sensor_spin = QDoubleSpinBox()
@@ -345,49 +391,27 @@ class RobotWebGUI(QMainWindow):
         self.sensor_spin.setValue(self.sensor_range)
         self.sensor_spin.valueChanged.connect(self.on_sensor_range_changed)
         sensor_layout.addWidget(self.sensor_spin)
-        settings_layout.addLayout(sensor_layout)
+        sensor_comm_layout.addLayout(sensor_layout)
         
-        # Damping
-        damp_layout = QHBoxLayout()
-        damp_layout.addWidget(QLabel("Damping:"))
-        self.damp_spin = QDoubleSpinBox()
-        self.damp_spin.setRange(0.0, 1.0)
-        self.damp_spin.setSingleStep(0.01)
-        self.damp_spin.setValue(self.damping)
-        self.damp_spin.valueChanged.connect(self.on_damping_changed)
-        damp_layout.addWidget(self.damp_spin)
-        settings_layout.addLayout(damp_layout)
+        landmarks_layout = QHBoxLayout()
+        landmarks_layout.addWidget(QLabel("Num Landmarks:"))
+        self.num_landmarks_spin = QSpinBox()
+        self.num_landmarks_spin.setRange(0, 10)
+        self.num_landmarks_spin.setValue(self.num_landmarks)
+        self.num_landmarks_spin.valueChanged.connect(self.on_num_landmarks_changed)
+        landmarks_layout.addWidget(self.num_landmarks_spin)
+        sensor_comm_layout.addLayout(landmarks_layout)
         
-        # Noise fraction
-        noise_layout = QHBoxLayout()
-        noise_layout.addWidget(QLabel("Noise Fraction:"))
-        self.noise_spin = QDoubleSpinBox()
-        self.noise_spin.setRange(0.0, 0.1)
-        self.noise_spin.setSingleStep(0.001)
-        self.noise_spin.setValue(self.noise_std[0])
-        self.noise_spin.valueChanged.connect(self.on_noise_changed)
-        noise_layout.addWidget(self.noise_spin)
-        settings_layout.addLayout(noise_layout)
+        self.landmark_only_cb = QCheckBox("Use Landmark Only")
+        self.landmark_only_cb.setChecked(self.use_landmark_only)
+        self.landmark_only_cb.stateChanged.connect(self.on_landmark_only_changed)
+        sensor_comm_layout.addWidget(self.landmark_only_cb)
         
-        # Is robust
-        self.robust_cb = QCheckBox("Is Robust")
-        self.robust_cb.setChecked(self.is_robust)
-        self.robust_cb.stateChanged.connect(self.on_robust_changed)
-        settings_layout.addWidget(self.robust_cb)
-        
-        # Use odometry
-        self.odometry_cb = QCheckBox("Use Odometry Factors")
-        self.odometry_cb.setChecked(self.use_odometry)
-        self.odometry_cb.stateChanged.connect(self.on_odometry_changed)
-        settings_layout.addWidget(self.odometry_cb)
-        
-        # Async communication
         self.async_cb = QCheckBox("Async Communication")
         self.async_cb.setChecked(self.async_communication)
         self.async_cb.stateChanged.connect(self.on_async_changed)
-        settings_layout.addWidget(self.async_cb)
+        sensor_comm_layout.addWidget(self.async_cb)
         
-        # Communication drop rate
         drop_layout = QHBoxLayout()
         drop_layout.addWidget(QLabel("Packet Loss:"))
         self.drop_spin = QDoubleSpinBox()
@@ -397,20 +421,121 @@ class RobotWebGUI(QMainWindow):
         self.drop_spin.setSuffix("%")
         self.drop_spin.valueChanged.connect(self.on_drop_rate_changed)
         drop_layout.addWidget(self.drop_spin)
-        settings_layout.addLayout(drop_layout)
+        sensor_comm_layout.addLayout(drop_layout)
         
-        # Allow dynamic join/leave
+        sensor_comm_group.setLayout(sensor_comm_layout)
+        def update_sensor_comm_arrow(checked):
+            sensor_comm_group.setTitle("▶ Sensor & Comm" if not checked else "Sensor & Comm")
+        sensor_comm_group.toggled.connect(update_sensor_comm_arrow)
+        settings_layout.addWidget(sensor_comm_group)
+        
+        # Sub-group: GBP Parameters
+        gbp_params_group = QGroupBox("GBP Parameters")
+        gbp_params_group.setCheckable(True)
+        gbp_params_group.setChecked(False)  # Start collapsed to reduce clutter
+        gbp_params_group.setStyleSheet("""
+            QGroupBox { 
+                font-weight: bold; 
+                border: 1px solid #555;
+                border-radius: 3px;
+                margin-top: 5px;
+                padding-top: 5px;
+                font-size: 9pt;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 5px;
+                padding: 0 3px;
+            }
+        """)
+        gbp_params_layout = QVBoxLayout()
+        gbp_params_layout.setSpacing(5)
+        
+        iter_layout = QHBoxLayout()
+        iter_layout.addWidget(QLabel("Iter Before Mot:"))
+        self.iter_spin = QSpinBox()
+        self.iter_spin.setRange(1, 20)
+        self.iter_spin.setValue(self.iter_before_motion)
+        self.iter_spin.valueChanged.connect(self.on_iter_changed)
+        iter_layout.addWidget(self.iter_spin)
+        gbp_params_layout.addLayout(iter_layout)
+        
+        lin_layout = QHBoxLayout()
+        lin_layout.addWidget(QLabel("Linearize Every:"))
+        self.lin_spin = QSpinBox()
+        self.lin_spin.setRange(1, 10)
+        self.lin_spin.setValue(self.linearize_every)
+        self.lin_spin.valueChanged.connect(self.on_linearize_changed)
+        lin_layout.addWidget(self.lin_spin)
+        gbp_params_layout.addLayout(lin_layout)
+        
+        damp_layout = QHBoxLayout()
+        damp_layout.addWidget(QLabel("Damping:"))
+        self.damp_spin = QDoubleSpinBox()
+        self.damp_spin.setRange(0.0, 1.0)
+        self.damp_spin.setSingleStep(0.01)
+        self.damp_spin.setValue(self.damping)
+        self.damp_spin.valueChanged.connect(self.on_damping_changed)
+        damp_layout.addWidget(self.damp_spin)
+        gbp_params_layout.addLayout(damp_layout)
+        
+        noise_layout = QHBoxLayout()
+        noise_layout.addWidget(QLabel("Noise Fraction:"))
+        self.noise_spin = QDoubleSpinBox()
+        self.noise_spin.setRange(0.0, 0.1)
+        self.noise_spin.setSingleStep(0.001)
+        self.noise_spin.setValue(self.noise_std[0])
+        self.noise_spin.valueChanged.connect(self.on_noise_changed)
+        noise_layout.addWidget(self.noise_spin)
+        gbp_params_layout.addLayout(noise_layout)
+        
+        self.robust_cb = QCheckBox("Is Robust")
+        self.robust_cb.setChecked(self.is_robust)
+        self.robust_cb.stateChanged.connect(self.on_robust_changed)
+        gbp_params_layout.addWidget(self.robust_cb)
+        
+        self.odometry_cb = QCheckBox("Use Odometry Factors")
+        self.odometry_cb.setChecked(self.use_odometry)
+        self.odometry_cb.stateChanged.connect(self.on_odometry_changed)
+        gbp_params_layout.addWidget(self.odometry_cb)
+        
+        gbp_params_group.setLayout(gbp_params_layout)
+        def update_gbp_params_arrow(checked):
+            gbp_params_group.setTitle("▶ GBP Parameters" if not checked else "GBP Parameters")
+        gbp_params_group.toggled.connect(update_gbp_params_arrow)
+        settings_layout.addWidget(gbp_params_group)
+        
+        # Keep dynamic join/leave in main settings
         self.dynamic_cb = QCheckBox("Allow Dynamic Join/Leave")
         self.dynamic_cb.setChecked(self.allow_dynamic_join_leave)
         self.dynamic_cb.stateChanged.connect(self.on_dynamic_changed)
         settings_layout.addWidget(self.dynamic_cb)
         
         settings_group.setLayout(settings_layout)
+        # Connect toggle to update arrow indicator
+        def update_settings_arrow(checked):
+            settings_group.setTitle("▶ Settings" if not checked else "▼ Settings")
+        settings_group.toggled.connect(update_settings_arrow)
         layout.addWidget(settings_group)
         
-        # Visualization Group
+        # Visualization Group - Collapsible
         viz_group = QGroupBox("▼ Visualisation")
-        viz_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        viz_group.setCheckable(True)
+        viz_group.setChecked(True)  # Start expanded
+        viz_group.setStyleSheet("""
+            QGroupBox { 
+                font-weight: bold; 
+                border: 2px solid #555;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
         viz_layout = QVBoxLayout()
         
         self.show_factors_cb = QCheckBox("Show Inter-robot Communication")
@@ -458,11 +583,30 @@ class RobotWebGUI(QMainWindow):
         viz_layout.addWidget(self.run_cb)
         
         viz_group.setLayout(viz_layout)
+        # Connect toggle to update arrow indicator
+        def update_viz_arrow(checked):
+            viz_group.setTitle("▶ Visualisation" if not checked else "▼ Visualisation")
+        viz_group.toggled.connect(update_viz_arrow)
         layout.addWidget(viz_group)
         
-        # Debug/Status Group
+        # Debug/Status Group - Collapsible
         debug_group = QGroupBox("▼ Status")
-        debug_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        debug_group.setCheckable(True)
+        debug_group.setChecked(True)  # Start expanded
+        debug_group.setStyleSheet("""
+            QGroupBox { 
+                font-weight: bold; 
+                border: 2px solid #555;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
         debug_layout = QVBoxLayout()
         
         self.status_label = QLabel("Status: Initializing...")
@@ -480,9 +624,17 @@ class RobotWebGUI(QMainWindow):
         debug_layout.addWidget(self.robots_status_label)
         
         debug_group.setLayout(debug_layout)
+        # Connect toggle to update arrow indicator
+        def update_debug_arrow(checked):
+            debug_group.setTitle("▶ Status" if not checked else "▼ Status")
+        debug_group.toggled.connect(update_debug_arrow)
         layout.addWidget(debug_group)
         
         layout.addStretch()
+        
+        # Set content widget to scroll area
+        scroll.setWidget(content_widget)
+        main_layout.addWidget(scroll)
         
         return panel
     
@@ -768,7 +920,8 @@ class RobotWebGUI(QMainWindow):
                             messages_received += 1
                 
                 # 3. PEER OBSERVATIONS (Robot-to-robot messages)
-                # Robots observe each other's ESTIMATED positions (mu), not ground truth!
+                # Each robot observes ALL other robots within sensor range and receives their state
+                # This ensures bidirectional communication: Robot i gets Robot j's state, and vice versa
                 if not self.use_landmark_only:
                     for j, neighbor in enumerate(self.robots):
                         if i != j and neighbor.is_active:
@@ -780,54 +933,68 @@ class RobotWebGUI(QMainWindow):
                                 self.active_connections.add(connection)
                                 
                                 # Simulate asynchronous communication
+                                message_dropped = False
+                                message_delayed = False
+                                
                                 if self.async_communication:
                                     # Packet loss simulation (cut off wifi)
                                     if np.random.random() < self.communication_drop_rate:
                                         self.dropped_messages_count += 1
+                                        message_dropped = True
                                         # Add to message queue for delayed delivery (simulating retry)
-                                        if neighbor.id not in robot.message_queue:
-                                            robot.message_queue.append({
-                                                'from': neighbor.id,
-                                                'iter': self.iter_count,
-                                                'delayed': True
-                                            })
-                                        continue  # Message dropped
+                                        queue_entry = {
+                                            'from': neighbor.id,
+                                            'iter': self.iter_count,
+                                            'delayed': True
+                                        }
+                                        # Check if already in queue to avoid duplicates
+                                        if not any(q['from'] == neighbor.id for q in robot.message_queue):
+                                            robot.message_queue.append(queue_entry)
                                     
                                     # Message delay (store in queue for future delivery)
-                                    if self.communication_delay > 0:
+                                    if not message_dropped and self.communication_delay > 0:
                                         if neighbor.id not in robot.last_message_time or \
                                            self.iter_count - robot.last_message_time[neighbor.id] >= self.communication_delay:
                                             robot.last_message_time[neighbor.id] = self.iter_count
                                         else:
+                                            message_delayed = True
                                             # Message delayed - add to queue
-                                            if neighbor.id not in robot.message_queue:
-                                                robot.message_queue.append({
-                                                    'from': neighbor.id,
-                                                    'iter': self.iter_count,
-                                                    'delayed': True
-                                                })
-                                            continue  # Message delayed
+                                            queue_entry = {
+                                                'from': neighbor.id,
+                                                'iter': self.iter_count,
+                                                'delayed': True
+                                            }
+                                            if not any(q['from'] == neighbor.id for q in robot.message_queue):
+                                                robot.message_queue.append(queue_entry)
                                 
-                                # Generate measurement from neighbor's ESTIMATED position
-                                dx = neighbor.mu[0] - robot.mu[0]
-                                dy = neighbor.mu[1] - robot.mu[1]
-                                r = np.sqrt(dx**2 + dy**2)
-                                angle = np.arctan2(dy, dx)
-                                
-                                # Add sensor noise (sometimes with outliers for robust testing)
-                                if self.is_robust and np.random.random() < 0.05:  # 5% outlier rate
-                                    measurement = np.array([r, angle]) + np.random.normal(0, self.noise_std[0] * 5, 2)
-                                else:
-                                    measurement = np.array([r, angle]) + np.random.normal(0, self.noise_std[0], 2)
-                                
-                                # Neighbor creates message (with robust factor if enabled)
-                                message = neighbor.get_local_message(robot.mu, measurement, self.noise_std, self.is_robust)
-                                robot.inbox[neighbor.id] = message
-                                messages_received += 1
-                                
-                                # For logging
-                                dist_gt = np.linalg.norm(robot.gt_pos - neighbor.gt_pos)
-                                message_details.append(f"  {robot.name}: received from {neighbor.name} (est_dist={dist_estimated:.2f}, gt_dist={dist_gt:.2f})")
+                                # Only send message if not dropped or delayed
+                                if not message_dropped and not message_delayed:
+                                    # Generate measurement from robot's perspective observing neighbor
+                                    # This measurement represents: "I see neighbor at distance r and angle"
+                                    dx = neighbor.mu[0] - robot.mu[0]
+                                    dy = neighbor.mu[1] - robot.mu[1]
+                                    r = np.sqrt(dx**2 + dy**2)
+                                    angle = np.arctan2(dy, dx)
+                                    
+                                    # Add sensor noise (sometimes with outliers for robust testing)
+                                    if self.is_robust and np.random.random() < 0.05:  # 5% outlier rate
+                                        measurement = np.array([r, angle]) + np.random.normal(0, self.noise_std[0] * 5, 2)
+                                    else:
+                                        measurement = np.array([r, angle]) + np.random.normal(0, self.noise_std[0], 2)
+                                    
+                                    # Neighbor creates message containing its state (position information)
+                                    # This message says: "Based on your observation of me, here's information about my position"
+                                    message = neighbor.get_local_message(robot.mu, measurement, self.noise_std, self.is_robust)
+                                    robot.inbox[neighbor.id] = message
+                                    messages_received += 1
+                                    
+                                    # For logging
+                                    dist_gt = np.linalg.norm(robot.gt_pos - neighbor.gt_pos)
+                                    message_details.append(f"  {robot.name}: received from {neighbor.name} (est_dist={dist_estimated:.2f}, gt_dist={dist_gt:.2f})")
+                                elif message_dropped:
+                                    message_details.append(f"  {robot.name}: message from {neighbor.name} DROPPED (packet loss)")
+                                elif message_delayed:
+                                    message_details.append(f"  {robot.name}: message from {neighbor.name} DELAYED (queued)")
                 
                 # Process queued messages (delayed/dropped messages that are now deliverable)
                 if self.async_communication and robot.message_queue:
@@ -922,24 +1089,46 @@ class RobotWebGUI(QMainWindow):
             # Console logging
             if self.debug_console and self.messages_per_iteration > 0:
                 print(f"\n[Iteration {self.iter_count}] Messages exchanged: {self.messages_per_iteration}")
-                for detail in message_details[:10]:  # Limit to first 10 to avoid spam
+                
+                # Show message summary per robot
+                for robot in self.robots:
+                    if robot.id in self.last_update_stats:
+                        stats = self.last_update_stats[robot.id]
+                        neighbor_count = len([k for k in robot.inbox.keys() if not k.startswith('landmark_') and not k.startswith('odometry')])
+                        print(f"  {robot.name}: received {stats['messages']} messages ({neighbor_count} from neighbors)")
+                
+                for detail in message_details[:15]:  # Show more details
                     print(detail)
-                if len(message_details) > 10:
-                    print(f"  ... and {len(message_details) - 10} more messages")
+                if len(message_details) > 15:
+                    print(f"  ... and {len(message_details) - 15} more messages")
                 
                 # Print position updates
                 active_robots = sum(1 for r in self.robots if len(r.inbox) > 0)
                 avg_error = np.mean([stats['error'] for stats in self.last_update_stats.values()])
                 print(f"  Active robots: {active_robots}/{len(self.robots)}, Avg position error: {avg_error:.3f}")
                 
+                # Check for robots not receiving messages
+                robots_without_messages = [r for r in self.robots if r.is_active and len([k for k in r.inbox.keys() if not k.startswith('odometry')]) == 0]
+                if robots_without_messages:
+                    print(f"  WARNING: {len(robots_without_messages)} robots received no neighbor messages: {[r.name for r in robots_without_messages]}")
+                
                 # Track GPB performance metrics (only during GBP iterations)
                 if self.last_update_stats:
                     avg_error = np.mean([stats['error'] for stats in self.last_update_stats.values()])
                     max_error = max([stats['error'] for stats in self.last_update_stats.values()])
                     
-                    # Store in history
+                    # Store average in history
                     self.gpb_error_history.append(avg_error)
                     self.gpb_message_history.append(self.messages_per_iteration)
+                    
+                    # Store individual robot errors
+                    for robot_id, stats in self.last_update_stats.items():
+                        if robot_id not in self.gpb_robot_errors:
+                            self.gpb_robot_errors[robot_id] = []
+                        self.gpb_robot_errors[robot_id].append(stats['error'])
+                        # Limit individual robot error history
+                        if len(self.gpb_robot_errors[robot_id]) > self.max_history_length:
+                            self.gpb_robot_errors[robot_id].pop(0)
                     
                     # Calculate convergence metric (rate of error reduction)
                     if len(self.gpb_error_history) > 10:
@@ -997,15 +1186,16 @@ class RobotWebGUI(QMainWindow):
                     self.ax.plot(path[:, 0], path[:, 1], '-', color=colors[i], 
                                alpha=0.4, linewidth=1.5, label=f"{robot.name} path")
         
-        # Draw sensor ranges (visualize detection range) - only for first robot to reduce clutter
-        if self.show_factors and len(self.robots) > 0:
-            # Show sensor range for first robot as example
-            first_robot = self.robots[0]
-            sensor_circle = plt.Circle(first_robot.mu, self.sensor_range, 
-                                     fill=False, linestyle=':', color='gray', 
-                                     alpha=0.25, linewidth=1.5, zorder=2,
-                                     label='Sensor Range' if not self.show_factors else '')
-            self.ax.add_patch(sensor_circle)
+        # Draw sensor ranges (visualize detection range) for all robots
+        if self.show_factors:
+            sensor_range_label_added = False
+            for robot in self.robots:
+                sensor_circle = plt.Circle(robot.mu, self.sensor_range, 
+                                         fill=False, linestyle=':', color='gray', 
+                                         alpha=0.25, linewidth=1.5, zorder=2,
+                                         label='Sensor Range' if not sensor_range_label_added else '')
+                self.ax.add_patch(sensor_circle)
+                sensor_range_label_added = True
         
         # Draw inter-robot communication (GPB messages) - GREEN lines like reference
         inter_robot_connections_drawn = False
@@ -1110,7 +1300,7 @@ class RobotWebGUI(QMainWindow):
             # Differential robots: circles with orientation arrows
             self.ax.plot(robot.mu[0], robot.mu[1], 'o', color=colors[i], 
                         markersize=10, markeredgecolor='black', markeredgewidth=1.5,
-                        label=f"Robot {i+1}" if i < 3 else None, zorder=5)
+                        label=f"Robot {i+1}", zorder=5)
             # Draw orientation arrow
             arrow_length = 0.8
             dx = arrow_length * np.cos(robot.angle)
@@ -1142,21 +1332,60 @@ class RobotWebGUI(QMainWindow):
                           loc='center left', bbox_to_anchor=(1.02, 0.5),
                           fontsize=9, framealpha=0.9, fancybox=True, shadow=True)
         
+        # Add author footer in bottom right corner
+        footer_text = "For educational purposes\n"
+        footer_text += "Author: Thiwanka Jayasiri\n"
+        footer_text += "Ref: Distributed GBP for Multi-Robot SLAM (arXiv:2202.03314)"
+        self.ax.text(0.99, 0.01, footer_text, 
+                    transform=self.ax.transAxes,
+                    fontsize=7, 
+                    ha='right', va='bottom',
+                    bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8, edgecolor='gray'),
+                    zorder=100)
+        
         # Update GPB performance plot
         self.ax_gpb.clear()
         if len(self.gpb_error_history) > 1:
             iterations = list(range(len(self.gpb_error_history)))
-            self.ax_gpb.plot(iterations, self.gpb_error_history, 'b-', linewidth=2, label='Avg Error')
+            
+            # Plot individual robot errors (lighter, thinner lines)
+            colors = plt.cm.tab10(np.linspace(0, 1, max(10, len(self.robots))))
+            individual_lines_drawn = False
+            for i, robot in enumerate(self.robots):
+                if robot.id in self.gpb_robot_errors and len(self.gpb_robot_errors[robot.id]) > 1:
+                    robot_iterations = list(range(len(self.gpb_robot_errors[robot.id])))
+                    # Plot individual robot error - don't require exact length match
+                    # Just plot what we have (they'll align over time)
+                    self.ax_gpb.plot(robot_iterations, self.gpb_robot_errors[robot.id], 
+                                   '-', color=colors[i], linewidth=1, alpha=0.5,
+                                   label=f'Robot {i+1}', zorder=5)
+                    individual_lines_drawn = True
+            
+            # Plot average error (thicker, more prominent line)
+            self.ax_gpb.plot(iterations, self.gpb_error_history, 'b-', linewidth=2.5, 
+                           label='Average Error', zorder=10)
+            
             self.ax_gpb.set_xlabel("GBP Iteration", fontsize=10)
             self.ax_gpb.set_ylabel("Position Error", fontsize=10)
-            self.ax_gpb.set_title("GPB Performance: Average Position Error Over Time", fontsize=10, fontweight='bold')
+            self.ax_gpb.set_title("GPB Performance: Individual & Average Position Errors", fontsize=10, fontweight='bold')
             self.ax_gpb.grid(True, alpha=0.3)
+            # Position legend outside plot area to the right
+            self.ax_gpb.legend(loc='center left', bbox_to_anchor=(1.02, 0.5),
+                              fontsize=7, framealpha=0.9, fancybox=True, shadow=True)
             
             # Add current error as text
             if self.gpb_error_history:
                 current_error = self.gpb_error_history[-1]
-                self.ax_gpb.text(0.02, 0.98, f'Current Error: {current_error:.3f}', 
-                               transform=self.ax_gpb.transAxes, fontsize=9,
+                # Also show min/max
+                if self.last_update_stats:
+                    current_errors = [stats['error'] for stats in self.last_update_stats.values()]
+                    min_err = min(current_errors)
+                    max_err = max(current_errors)
+                    error_text = f'Avg: {current_error:.3f} | Min: {min_err:.3f} | Max: {max_err:.3f}'
+                else:
+                    error_text = f'Current Error: {current_error:.3f}'
+                self.ax_gpb.text(0.02, 0.98, error_text, 
+                               transform=self.ax_gpb.transAxes, fontsize=8,
                                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
             
             # Show convergence trend
@@ -1173,6 +1402,15 @@ class RobotWebGUI(QMainWindow):
                                verticalalignment='top', horizontalalignment='right',
                                bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
         
+        # Add author footer to GPB plot as well
+        footer_text_gpb = "For educational purposes | Author: Thiwanka Jayasiri | Ref: arXiv:2202.03314"
+        self.ax_gpb.text(0.99, 0.01, footer_text_gpb, 
+                         transform=self.ax_gpb.transAxes,
+                         fontsize=6, 
+                         ha='right', va='bottom',
+                         bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='gray'),
+                         zorder=100)
+        
         self.canvas.draw()
     
     def update_status_display(self):
@@ -1180,6 +1418,14 @@ class RobotWebGUI(QMainWindow):
         active_robots = sum(1 for r in self.robots if len(r.inbox) > 0)
         total_connections = len(self.active_connections) * 2  # Bidirectional
         total_queue_size = sum(self.message_queue_sizes.values())
+        
+        # Count neighbor messages per robot (excluding odometry and landmarks)
+        robot_neighbor_counts = {}
+        for robot in self.robots:
+            if robot.is_active:
+                neighbor_msgs = len([k for k in robot.inbox.keys() 
+                                    if not k.startswith('landmark_') and not k.startswith('odometry')])
+                robot_neighbor_counts[robot.name] = neighbor_msgs
         
         # Calculate average position error
         if self.last_update_stats:
@@ -1194,7 +1440,14 @@ class RobotWebGUI(QMainWindow):
         status_text += f"Active: {active_robots}/{len(self.robots)} robots\n"
         status_text += f"Connections: {total_connections}\n"
         if total_queue_size > 0:
-            status_text += f"Queued: {total_queue_size} msgs"
+            status_text += f"Queued: {total_queue_size} msgs\n"
+        # Show neighbor message counts
+        if robot_neighbor_counts:
+            status_text += f"Neighbor msgs:\n"
+            for name, count in list(robot_neighbor_counts.items())[:3]:  # Show first 3
+                status_text += f"  {name}: {count}\n"
+            if len(robot_neighbor_counts) > 3:
+                status_text += f"  ..."
         self.status_label.setText(status_text)
         
         msg_text = f"Total Messages: {self.total_messages} (Last: {self.messages_per_iteration})"
