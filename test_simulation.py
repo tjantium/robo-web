@@ -15,6 +15,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.patches import Circle as MplCircle
 from robot_m import RobotAgent
 from rvo import RVO
+from ga_landmark_selector import LandmarkSelectorGA, select_optimal_landmarks
 
 class RobotWebGUI(QMainWindow):
     def __init__(self):
@@ -51,6 +52,7 @@ class RobotWebGUI(QMainWindow):
         self.rvo_time_horizon = 3.0  # Increased for better planning
         self.rvo_neighbor_dist = 3.5  # Increased to keep robots more separated
         self.rvo_max_speed = 0.8  # Slightly reduced for smoother motion
+        self.min_robot_separation = 1.5  # Minimum distance between robot centers (2 * radius + safety)
         
         # Obstacle settings
         self.num_obstacles = 3  # Reduced for cleaner demo
@@ -58,6 +60,19 @@ class RobotWebGUI(QMainWindow):
         self.obstacles = []  # List of obstacle positions
         self.obstacle_velocities = []  # List of obstacle velocities
         self.obstacle_moving = True  # Whether obstacles move
+        
+        # Maze/Non-convex environment settings
+        self.use_maze = False  # Enable maze environment
+        self.maze_walls = []  # List of wall segments: [(start, end), ...]
+        self.maze_complexity = 5  # Number of walls in maze
+        
+        # GA Landmark Selection settings
+        self.use_ga_landmark_selection = False  # Use GA to select optimal landmarks
+        self.ga_max_selected = 3  # Maximum landmarks to select via GA
+        self.ga_generations = 10  # GA evolution generations
+        self.robot_selected_landmarks = {}  # {robot_id: [landmark_indices]}
+        self.ga_fitness_history = []  # Track GA evolution: [{robot_id: [{'best': float, 'avg': float}, ...]}, ...]
+        self.ga_evolution_data = {}  # {robot_id: [{'best': float, 'avg': float}, ...]} - latest evolution
         
         # Technical goals settings
         self.use_odometry = True  # Each robot has odometry factors (local fragment)
@@ -101,6 +116,13 @@ class RobotWebGUI(QMainWindow):
         self.robot_paths = {}  # Store paths for each robot
         self.robot_gt_paths = {}  # Store ground truth paths
         
+        # Coverage map: track which areas have been visited by robots
+        self.coverage_grid_resolution = 0.5  # Grid cell size (smaller = finer resolution)
+        self.coverage_grid = None  # Will be initialized as 2D array
+        self.coverage_grid_bounds = None  # (x_min, x_max, y_min, y_max)
+        self.show_coverage_map = True  # Toggle for coverage visualization
+        self.coverage_decay_rate = 0.0  # How fast coverage fades (0 = no decay, 1 = instant)
+        
         # Multiple landmarks (list of positions)
         self.landmarks = [
             np.array([0.0, 0.0]),  # Default landmark at origin
@@ -113,6 +135,11 @@ class RobotWebGUI(QMainWindow):
         
         self.init_robots()
         self.init_obstacles()
+        self.init_maze()  # Initialize maze walls if enabled
+        
+        # Robot sensor view visualization (DISABLED - not working properly)
+        self.show_robot_sensor_view = False  # Toggle for sensor view panel
+        self.selected_robot_for_view = 0  # Which robot to show sensor view for
         
         # 2. UI Layout
         main_widget = QWidget()
@@ -131,20 +158,15 @@ class RobotWebGUI(QMainWindow):
         self.fps_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         viz_layout.addWidget(self.fps_label)
         
-        # Main simulation plot - leave space on right for legend
-        self.fig = plt.figure(figsize=(14, 10))  # Wider figure to accommodate legend
+        # Main simulation plot - will be initialized in update_plot based on sensor view toggle
+        # Initialize with default layout (no sensor view)
+        self.fig = plt.figure(figsize=(14, 10))
         gs = self.fig.add_gridspec(2, 1, height_ratios=[2, 1], hspace=0.3, 
-                                   left=0.08, right=0.70, top=0.95, bottom=0.05)
-        
-        # Top: Main simulation canvas
-        self.ax = self.fig.add_subplot(gs[0])
-        
-        # Bottom: GPB performance plot
-        self.ax_gpb = self.fig.add_subplot(gs[1])
-        self.ax_gpb.set_xlabel("Iteration")
-        self.ax_gpb.set_ylabel("GPB Error")
-        self.ax_gpb.set_title("GPB Performance: Average Position Error")
-        self.ax_gpb.grid(True, alpha=0.3)
+                                   left=0.05, right=0.70, top=0.95, bottom=0.05)
+        self.ax = self.fig.add_subplot(gs[0, 0])
+        self.ax_gpb = self.fig.add_subplot(gs[1, 0])
+        self.ax_ga = None  # Will be created when GA is enabled
+        self.ax_sensor = None  # Will be created when sensor view is enabled
         
         self.canvas = FigureCanvas(self.fig)
         viz_layout.addWidget(self.canvas)
@@ -189,6 +211,18 @@ class RobotWebGUI(QMainWindow):
         self.robots = []
         self.robot_paths = {}
         self.robot_gt_paths = {}
+        
+        # Initialize coverage grid
+        grid_margin = 2.0  # Extra margin around boundary
+        self.coverage_grid_bounds = (
+            self.circle_center[0] - self.boundary_radius - grid_margin,
+            self.circle_center[0] + self.boundary_radius + grid_margin,
+            self.circle_center[1] - self.boundary_radius - grid_margin,
+            self.circle_center[1] + self.boundary_radius + grid_margin
+        )
+        x_size = int((self.coverage_grid_bounds[1] - self.coverage_grid_bounds[0]) / self.coverage_grid_resolution)
+        y_size = int((self.coverage_grid_bounds[3] - self.coverage_grid_bounds[2]) / self.coverage_grid_resolution)
+        self.coverage_grid = np.zeros((y_size, x_size), dtype=np.float32)  # y, x order for imshow
         # Clear error history when robots are reinitialized (new robots = new IDs)
         self.gpb_robot_errors = {}
         self.gpb_error_history = []
@@ -203,10 +237,11 @@ class RobotWebGUI(QMainWindow):
             initial_estimate = gt_pos + np.random.normal(0, 0.2, 2)
             
             robot = RobotAgent(f"DiffRobot{i+1}", initial_estimate, robot_type='differential')
-            robot.gt_pos = gt_pos.copy()  # Store ground truth
+            robot.gt_pos = gt_pos.copy()  # Store ground truth (actual physical position)
+            robot.gt_angle = angle  # Ground truth angle
             # Alternate direction: even robots clockwise, odd robots counter-clockwise
             robot.direction = 1 if i % 2 == 0 else -1  # 1 for clockwise, -1 for counter-clockwise
-            robot.angle = angle + np.pi / 2 * robot.direction  # Face tangent to circle
+            robot.angle = angle + np.pi / 2 * robot.direction  # Face tangent to circle (for visualization)
             robot.estimated_angle = angle  # Initialize estimated angle for motion model
             robot.expected_pos = gt_pos.copy()  # Initialize expected position
             robot.last_position = initial_estimate.copy()  # For odometry
@@ -223,6 +258,9 @@ class RobotWebGUI(QMainWindow):
             self.robots.append(robot)
             self.robot_paths[robot.id] = [initial_estimate.copy()]
             self.robot_gt_paths[robot.id] = [gt_pos.copy()]
+            
+            # Mark initial position in coverage grid
+            self._update_coverage_grid(gt_pos, robot.radius)
         
     
     def init_obstacles(self):
@@ -269,6 +307,143 @@ class RobotWebGUI(QMainWindow):
                 vel = np.array([0.0, 0.0])
             
             self.obstacle_velocities.append(vel)
+    
+    def _closest_point_on_segment(self, point, seg_start, seg_end):
+        """
+        Find the closest point on a line segment to a given point.
+        
+        Args:
+            point: Point [x, y]
+            seg_start: Segment start [x, y]
+            seg_end: Segment end [x, y]
+            
+        Returns:
+            Closest point on segment [x, y]
+        """
+        seg_vec = seg_end - seg_start
+        seg_len_sq = np.dot(seg_vec, seg_vec)
+        
+        if seg_len_sq < 1e-10:  # Degenerate segment (start == end)
+            return seg_start.copy()
+        
+        point_vec = point - seg_start
+        t = np.dot(point_vec, seg_vec) / seg_len_sq
+        t = np.clip(t, 0.0, 1.0)  # Clamp to segment
+        
+        return seg_start + t * seg_vec
+    
+    def _update_coverage_grid(self, robot_pos, robot_radius):
+        """Update coverage grid based on robot's ground truth position."""
+        if self.coverage_grid is None:
+            return
+        
+        # Convert robot position to grid coordinates
+        x_min, x_max, y_min, y_max = self.coverage_grid_bounds
+        grid_x = int((robot_pos[0] - x_min) / self.coverage_grid_resolution)
+        grid_y = int((robot_pos[1] - y_min) / self.coverage_grid_resolution)
+        
+        # Mark cells within robot radius as visited
+        radius_cells = int(robot_radius / self.coverage_grid_resolution) + 1
+        for dy in range(-radius_cells, radius_cells + 1):
+            for dx in range(-radius_cells, radius_cells + 1):
+                cell_x = grid_x + dx
+                cell_y = grid_y + dy
+                
+                # Check bounds
+                if (0 <= cell_x < self.coverage_grid.shape[1] and 
+                    0 <= cell_y < self.coverage_grid.shape[0]):
+                    # Check if within circular radius
+                    dist = np.sqrt(dx**2 + dy**2) * self.coverage_grid_resolution
+                    if dist <= robot_radius:
+                        # Mark as visited (increment coverage value)
+                        self.coverage_grid[cell_y, cell_x] = min(
+                            self.coverage_grid[cell_y, cell_x] + 0.1, 1.0
+                        )
+        
+        # Apply decay if enabled
+        if self.coverage_decay_rate > 0:
+            self.coverage_grid *= (1.0 - self.coverage_decay_rate)
+    
+    def _robot_wall_collision(self, robot_pos, wall_start, wall_end, robot_radius):
+        """
+        Check if robot collides with a wall segment.
+        
+        Args:
+            robot_pos: Robot position [x, y]
+            wall_start: Wall segment start [x, y]
+            wall_end: Wall segment end [x, y]
+            robot_radius: Robot radius
+            
+        Returns:
+            True if collision detected
+        """
+        closest = self._closest_point_on_segment(robot_pos, wall_start, wall_end)
+        dist = np.linalg.norm(robot_pos - closest)
+        return dist < robot_radius
+    
+    def init_maze(self):
+        """Initialize maze walls for non-convex environment."""
+        self.maze_walls = []
+        if not self.use_maze:
+            return
+        
+        # Create a simple, visible maze pattern with prominent walls
+        # Walls are line segments: [(start_pos, end_pos), ...]
+        # Make walls clearly visible within the boundary
+        
+        # Use a simpler, more reliable approach
+        # Create walls that are guaranteed to be visible
+        
+        # Always create at least a cross pattern for visibility
+        # Make sure walls are clearly within the visible area
+        # Horizontal wall through center (guaranteed to be visible)
+        wall_length = self.boundary_radius * 0.8  # 80% of boundary radius
+        self.maze_walls.append((
+            np.array([-wall_length, 0.0]), 
+            np.array([wall_length, 0.0])
+        ))
+        
+        # Vertical wall through center (guaranteed to be visible)
+        self.maze_walls.append((
+            np.array([0.0, -wall_length]), 
+            np.array([0.0, wall_length])
+        ))
+        
+        # Add additional walls based on complexity
+        num_extra_walls = max(0, self.maze_complexity - 2)
+        
+        for i in range(num_extra_walls):
+            # Alternate between horizontal and vertical
+            if i % 2 == 0:
+                # Horizontal wall
+                y_pos = -self.boundary_radius * 0.5 + (i // 2 + 1) * (self.boundary_radius * 0.3 / (num_extra_walls // 2 + 1))
+                # Create wall with gap in middle
+                gap = self.boundary_radius * 0.2
+                self.maze_walls.append((
+                    np.array([-self.boundary_radius * 0.7, y_pos]),
+                    np.array([-gap, y_pos])
+                ))
+                self.maze_walls.append((
+                    np.array([gap, y_pos]),
+                    np.array([self.boundary_radius * 0.7, y_pos])
+                ))
+            else:
+                # Vertical wall
+                x_pos = -self.boundary_radius * 0.5 + ((i-1) // 2 + 1) * (self.boundary_radius * 0.3 / (num_extra_walls // 2 + 1))
+                # Create wall with gap in middle
+                gap = self.boundary_radius * 0.2
+                self.maze_walls.append((
+                    np.array([x_pos, -self.boundary_radius * 0.7]),
+                    np.array([x_pos, -gap])
+                ))
+                self.maze_walls.append((
+                    np.array([x_pos, gap]),
+                    np.array([x_pos, self.boundary_radius * 0.7])
+                ))
+        
+        # Debug output
+        if self.debug_console and len(self.maze_walls) > 0:
+            print(f"[Maze] Initialized {len(self.maze_walls)} wall segments (complexity={self.maze_complexity})")
     
     def create_control_panel(self):
         """Create the left control panel with settings."""
@@ -354,6 +529,12 @@ class RobotWebGUI(QMainWindow):
         self.radius_spin.valueChanged.connect(self.on_radius_changed)
         radius_layout.addWidget(self.radius_spin)
         robot_config_layout.addLayout(radius_layout)
+        
+        # RVO Collision Avoidance checkbox
+        self.use_rvo_cb = QCheckBox("Enable RVO Collision Avoidance")
+        self.use_rvo_cb.setChecked(self.use_rvo)
+        self.use_rvo_cb.stateChanged.connect(self.on_rvo_changed)
+        robot_config_layout.addWidget(self.use_rvo_cb)
         
         robot_config_group.setLayout(robot_config_layout)
         def update_robot_config_arrow(checked):
@@ -511,6 +692,71 @@ class RobotWebGUI(QMainWindow):
         self.dynamic_cb.stateChanged.connect(self.on_dynamic_changed)
         settings_layout.addWidget(self.dynamic_cb)
         
+        # Sub-group: Maze & GA Settings
+        maze_ga_group = QGroupBox("Maze & GA Selection")
+        maze_ga_group.setCheckable(True)
+        maze_ga_group.setChecked(False)  # Start collapsed
+        maze_ga_group.setStyleSheet("""
+            QGroupBox { 
+                font-weight: bold; 
+                border: 1px solid #555;
+                border-radius: 3px;
+                margin-top: 5px;
+                padding-top: 5px;
+                font-size: 9pt;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 5px;
+                padding: 0 3px;
+            }
+        """)
+        maze_ga_layout = QVBoxLayout()
+        maze_ga_layout.setSpacing(5)
+        
+        self.use_maze_cb = QCheckBox("Enable Maze Environment")
+        self.use_maze_cb.setChecked(self.use_maze)
+        self.use_maze_cb.stateChanged.connect(self.on_maze_changed)
+        maze_ga_layout.addWidget(self.use_maze_cb)
+        
+        maze_complexity_layout = QHBoxLayout()
+        maze_complexity_layout.addWidget(QLabel("Maze Complexity:"))
+        self.maze_complexity_spin = QSpinBox()
+        self.maze_complexity_spin.setRange(3, 15)
+        self.maze_complexity_spin.setValue(self.maze_complexity)
+        self.maze_complexity_spin.valueChanged.connect(self.on_maze_complexity_changed)
+        maze_complexity_layout.addWidget(self.maze_complexity_spin)
+        maze_ga_layout.addLayout(maze_complexity_layout)
+        
+        self.use_ga_cb = QCheckBox("Use GA Landmark Selection")
+        self.use_ga_cb.setChecked(self.use_ga_landmark_selection)
+        self.use_ga_cb.stateChanged.connect(self.on_ga_selection_changed)
+        maze_ga_layout.addWidget(self.use_ga_cb)
+        
+        ga_max_layout = QHBoxLayout()
+        ga_max_layout.addWidget(QLabel("GA Max Selected:"))
+        self.ga_max_spin = QSpinBox()
+        self.ga_max_spin.setRange(1, 5)
+        self.ga_max_spin.setValue(self.ga_max_selected)
+        self.ga_max_spin.valueChanged.connect(self.on_ga_max_changed)
+        ga_max_layout.addWidget(self.ga_max_spin)
+        maze_ga_layout.addLayout(ga_max_layout)
+        
+        ga_gen_layout = QHBoxLayout()
+        ga_gen_layout.addWidget(QLabel("GA Generations:"))
+        self.ga_gen_spin = QSpinBox()
+        self.ga_gen_spin.setRange(5, 30)
+        self.ga_gen_spin.setValue(self.ga_generations)
+        self.ga_gen_spin.valueChanged.connect(self.on_ga_gen_changed)
+        ga_gen_layout.addWidget(self.ga_gen_spin)
+        maze_ga_layout.addLayout(ga_gen_layout)
+        
+        maze_ga_group.setLayout(maze_ga_layout)
+        def update_maze_ga_arrow(checked):
+            maze_ga_group.setTitle("▶ Maze & GA Selection" if not checked else "Maze & GA Selection")
+        maze_ga_group.toggled.connect(update_maze_ga_arrow)
+        settings_layout.addWidget(maze_ga_group)
+        
         settings_group.setLayout(settings_layout)
         # Connect toggle to update arrow indicator
         def update_settings_arrow(checked):
@@ -553,10 +799,30 @@ class RobotWebGUI(QMainWindow):
         self.show_path_cb.stateChanged.connect(self.on_show_path_changed)
         viz_layout.addWidget(self.show_path_cb)
         
+        self.show_coverage_cb = QCheckBox("Show Coverage Map")
+        self.show_coverage_cb.setChecked(self.show_coverage_map)
+        self.show_coverage_cb.stateChanged.connect(self.on_show_coverage_changed)
+        viz_layout.addWidget(self.show_coverage_cb)
+        
         self.show_samples_cb = QCheckBox("Show Samples")
         self.show_samples_cb.setChecked(self.show_samples)
         self.show_samples_cb.stateChanged.connect(self.on_show_samples_changed)
         viz_layout.addWidget(self.show_samples_cb)
+        
+        # Sensor view disabled - not working properly
+        # self.show_sensor_view_cb = QCheckBox("Show Robot Sensor View")
+        # self.show_sensor_view_cb.setChecked(self.show_robot_sensor_view)
+        # self.show_sensor_view_cb.stateChanged.connect(self.on_show_sensor_view_changed)
+        # viz_layout.addWidget(self.show_sensor_view_cb)
+        # 
+        # sensor_robot_layout = QHBoxLayout()
+        # sensor_robot_layout.addWidget(QLabel("Robot ID:"))
+        # self.sensor_robot_spin = QSpinBox()
+        # self.sensor_robot_spin.setRange(0, max(0, self.num_robots - 1))
+        # self.sensor_robot_spin.setValue(self.selected_robot_for_view)
+        # self.sensor_robot_spin.valueChanged.connect(self.on_sensor_robot_changed)
+        # sensor_robot_layout.addWidget(self.sensor_robot_spin)
+        # viz_layout.addLayout(sensor_robot_layout)
         
         self.follow_robot_cb = QCheckBox("Follow Robot")
         self.follow_robot_cb.setChecked(self.follow_robot)
@@ -656,6 +922,13 @@ class RobotWebGUI(QMainWindow):
     
     def on_radius_changed(self, value):
         self.circle_radius = value
+    
+    def on_rvo_changed(self, state):
+        """Handle RVO enable/disable checkbox change."""
+        checked_value = 2  # Qt.CheckState.Checked
+        self.use_rvo = (int(state) == checked_value)
+        if self.debug_console:
+            print(f"[RVO] {'Enabled' if self.use_rvo else 'Disabled'}")
         self.init_robots()
     
     def on_landmark_only_changed(self, state):
@@ -703,6 +976,35 @@ class RobotWebGUI(QMainWindow):
     def on_dynamic_changed(self, state):
         self.allow_dynamic_join_leave = (state == Qt.CheckState.Checked)
     
+    def on_maze_changed(self, state):
+        # Fix: stateChanged signal passes an integer (0=Unchecked, 2=Checked)
+        # Use explicit integer comparison for reliability
+        checked_value = 2  # Qt.CheckState.Checked
+        self.use_maze = (int(state) == checked_value)
+        self.init_maze()
+        # Force immediate update to show walls
+        if self.debug_console:
+            if self.use_maze:
+                print(f"[Maze] Enabled: {len(self.maze_walls)} walls created")
+            else:
+                print(f"[Maze] Disabled")
+    
+    def on_maze_complexity_changed(self, value):
+        self.maze_complexity = value
+        self.init_maze()
+    
+    def on_ga_selection_changed(self, state):
+        self.use_ga_landmark_selection = (state == Qt.CheckState.Checked)
+        # Clear selected landmarks when toggling
+        if not self.use_ga_landmark_selection:
+            self.robot_selected_landmarks = {}
+    
+    def on_ga_max_changed(self, value):
+        self.ga_max_selected = value
+    
+    def on_ga_gen_changed(self, value):
+        self.ga_generations = value
+    
     def on_show_factors_changed(self, state):
         self.show_factors = (state == Qt.CheckState.Checked)
     
@@ -712,8 +1014,27 @@ class RobotWebGUI(QMainWindow):
     def on_show_path_changed(self, state):
         self.show_path = (state == Qt.CheckState.Checked)
     
+    def on_show_coverage_changed(self, state):
+        self.show_coverage_map = (int(state) == 2)
+    
     def on_show_samples_changed(self, state):
         self.show_samples = (state == Qt.CheckState.Checked)
+    
+    # Sensor view disabled - not working properly
+    # def on_show_sensor_view_changed(self, state):
+    #     self.show_robot_sensor_view = (state == Qt.CheckState.Checked)
+    #     # Force immediate figure recreation
+    #     if hasattr(self, 'fig') and self.fig is not None:
+    #         # Force recreation by setting ax_sensor to None if disabling, or mark for creation if enabling
+    #         if not self.show_robot_sensor_view:
+    #             self.ax_sensor = None
+    #         # The figure will be recreated in the next update_plot call
+    #     if self.debug_console:
+    #         print(f"[Sensor View] {'Enabled' if self.show_robot_sensor_view else 'Disabled'}, will recreate figure on next update")
+    # 
+    # def on_sensor_robot_changed(self, value):
+    #     self.selected_robot_for_view = value
+    #     self.sensor_robot_spin.setRange(0, max(0, self.num_robots - 1))
     
     def on_follow_robot_changed(self, state):
         self.follow_robot = (state == Qt.CheckState.Checked)
@@ -773,7 +1094,8 @@ class RobotWebGUI(QMainWindow):
         # Update obstacles
         self.update_obstacles()
         
-        # Update differential drive robots with RVO
+        # Phase 1: Compute velocities for all robots (RVO planning)
+        robot_velocities = {}  # Store computed velocities before applying movement
         for robot in self.robots:
             if not robot.is_active:
                 continue
@@ -782,21 +1104,27 @@ class RobotWebGUI(QMainWindow):
             # Use robot's direction to determine rotation direction
             direction = getattr(robot, 'direction', 1)  # Default to clockwise if not set
             angular_velocity = 0.03 * direction  # Different directions for different robots
-            robot.estimated_angle += angular_velocity * self.dt
+            
+            # Update ground truth angle for motion planning
+            if not hasattr(robot, 'gt_angle'):
+                robot.gt_angle = getattr(robot, 'estimated_angle', 0.0)
+            robot.gt_angle += angular_velocity * self.dt
+            robot.estimated_angle += angular_velocity * self.dt  # Also update estimated for motion model
             
             # Use individual path parameters to avoid clustering
             if hasattr(robot, 'path_radius') and hasattr(robot, 'path_center_offset'):
                 path_center = self.circle_center + robot.path_center_offset
                 preferred_pos = path_center + robot.path_radius * np.array([
-                    np.cos(robot.estimated_angle), np.sin(robot.estimated_angle)
+                    np.cos(robot.gt_angle), np.sin(robot.gt_angle)
                 ])
             else:
                 # Fallback to default circular path
                 preferred_pos = self.circle_center + self.circle_radius * np.array([
-                    np.cos(robot.estimated_angle), np.sin(robot.estimated_angle)
+                    np.cos(robot.gt_angle), np.sin(robot.gt_angle)
                 ])
             
-            preferred_vel = (preferred_pos - robot.mu) / self.dt
+            # Preferred velocity based on ground truth position (where robot actually is)
+            preferred_vel = (preferred_pos - robot.gt_pos) / self.dt
             # Limit preferred velocity magnitude
             vel_mag = np.linalg.norm(preferred_vel)
             if vel_mag > self.rvo_max_speed:
@@ -806,16 +1134,16 @@ class RobotWebGUI(QMainWindow):
             # Apply RVO collision avoidance
             if self.use_rvo:
                 neighbors = []
-                # Add other robots as neighbors
+                # Add other robots as neighbors (use GROUND TRUTH positions for actual collision avoidance)
                 for neighbor in self.robots:
                     if neighbor.id != robot.id and neighbor.is_active:
-                        # Estimate neighbor velocity
-                        if len(self.robot_paths[neighbor.id]) > 1:
-                            neighbor_vel = (neighbor.mu - self.robot_paths[neighbor.id][-1]) / self.dt
+                        # Estimate neighbor velocity from ground truth path
+                        if len(self.robot_gt_paths[neighbor.id]) > 1:
+                            neighbor_vel = (neighbor.gt_pos - self.robot_gt_paths[neighbor.id][-1]) / self.dt
                         else:
                             neighbor_vel = np.array([0.0, 0.0])
                         neighbors.append({
-                            'pos': neighbor.mu,
+                            'pos': neighbor.gt_pos,  # Use ground truth position
                             'vel': neighbor_vel,
                             'radius': neighbor.radius,
                             'robot_radius': robot.radius
@@ -830,41 +1158,195 @@ class RobotWebGUI(QMainWindow):
                         'robot_radius': robot.radius
                     })
                 
-                # Compute safe velocity using RVO
+                # Add maze walls as static obstacles (only if RVO is enabled)
+                # When RVO is disabled, walls are still handled by collision detection below
+                if self.use_rvo and self.use_maze and self.maze_walls:
+                    for wall_start, wall_end in self.maze_walls:
+                        # Find closest point on wall segment to robot (use ground truth for actual avoidance)
+                        closest_point = self._closest_point_on_segment(robot.gt_pos, wall_start, wall_end)
+                        dist_to_wall = np.linalg.norm(robot.gt_pos - closest_point)
+                        
+                        # Only add as obstacle if robot is close enough to the wall
+                        wall_avoidance_dist = robot.radius + 0.5  # Robot radius + safety margin
+                        if dist_to_wall < wall_avoidance_dist * 2:  # Check within 2x avoidance distance
+                            # Treat wall as a static obstacle at closest point
+                            # Use a small radius to represent the wall thickness
+                            wall_radius = 0.3  # Effective wall thickness for collision
+                            neighbors.append({
+                                'pos': closest_point,
+                                'vel': np.array([0.0, 0.0]),  # Walls are static
+                                'radius': wall_radius,
+                                'robot_radius': robot.radius
+                            })
+                
+                # Compute safe velocity using RVO (use ground truth position for actual collision avoidance)
+                # Increase neighbor_dist to keep robots more separated
                 safe_vel = RVO.compute_rvo_velocity(
-                    robot.mu, preferred_vel, neighbors,
-                    self.rvo_time_horizon, self.rvo_neighbor_dist, self.rvo_max_speed
+                    robot.gt_pos, preferred_vel, neighbors,
+                    self.rvo_time_horizon, 
+                    max(self.rvo_neighbor_dist, (robot.radius + 0.5) * 2),  # At least 2x robot diameter
+                    self.rvo_max_speed
                 )
                 
-                # Convert to differential drive control
+                # Convert to differential drive control (use ground truth angle)
                 linear_vel, angular_vel = RVO.compute_differential_control(
-                    robot.mu, robot.angle, safe_vel,
+                    robot.gt_pos, robot.gt_angle, safe_vel,
                     max_linear=self.rvo_max_speed, max_angular=1.0
                 )
-                
-                robot.linear_vel = linear_vel
-                robot.angular_vel = angular_vel
             else:
-                # No RVO, use preferred velocity directly
+                # No RVO, use preferred velocity directly (use ground truth position/angle)
                 linear_vel, angular_vel = RVO.compute_differential_control(
-                    robot.mu, robot.angle, preferred_vel,
+                    robot.gt_pos, robot.gt_angle, preferred_vel,
                     max_linear=self.rvo_max_speed, max_angular=1.0
                 )
-                robot.linear_vel = linear_vel
-                robot.angular_vel = angular_vel
             
-            # Update robot kinematics
-            robot.update_kinematics(self.dt)
-            robot.gt_pos = robot.mu.copy()  # For visualization
+            # Store velocities for this robot
+            robot_velocities[robot.id] = {
+                'linear_vel': linear_vel,
+                'angular_vel': angular_vel
+            }
+        
+        # Phase 2: Apply movement for all robots
+        robot_old_positions = {}  # Store old positions for collision resolution
+        for robot in self.robots:
+            if not robot.is_active:
+                continue
+            
+            # Get computed velocities
+            vel_data = robot_velocities[robot.id]
+            robot.linear_vel = vel_data['linear_vel']
+            robot.angular_vel = vel_data['angular_vel']
+            
+            # Store old position before movement
+            robot_old_positions[robot.id] = {
+                'pos': robot.gt_pos.copy(),
+                'angle': robot.gt_angle
+            }
+            
+            # Update GROUND TRUTH position (actual physical movement)
+            # Ground truth moves based on actual kinematics, independent of estimates
+            # Update ground truth kinematics
+            if abs(robot.angular_vel) > 1e-6:
+                # Arc motion
+                radius = robot.linear_vel / (robot.angular_vel + 1e-6)
+                dtheta = robot.angular_vel * self.dt
+                dx = radius * (np.sin(robot.gt_angle + dtheta) - np.sin(robot.gt_angle))
+                dy = radius * (-np.cos(robot.gt_angle + dtheta) + np.cos(robot.gt_angle))
+            else:
+                # Straight motion
+                dx = robot.linear_vel * np.cos(robot.gt_angle) * self.dt
+                dy = robot.linear_vel * np.sin(robot.gt_angle) * self.dt
+            
+            robot.gt_pos += np.array([dx, dy])
+            robot.gt_angle += robot.angular_vel * self.dt
+        
+        # Phase 3: Resolve all collisions (process all robots to avoid double-processing)
+        # Check for robot-to-robot collisions (prevent robots from overlapping)
+        # This is a safety check that works even if RVO is disabled or fails
+        processed_pairs = set()
+        for i, robot in enumerate(self.robots):
+            if not robot.is_active:
+                continue
+            for j, other_robot in enumerate(self.robots):
+                if i >= j or not other_robot.is_active:
+                    continue
+                
+                # Avoid processing same pair twice
+                pair_id = tuple(sorted([robot.id, other_robot.id]))
+                if pair_id in processed_pairs:
+                    continue
+                processed_pairs.add(pair_id)
+                
+                dist_to_other = np.linalg.norm(robot.gt_pos - other_robot.gt_pos)
+                min_separation = self.min_robot_separation  # Minimum distance between robot centers
+                
+                if dist_to_other < min_separation:
+                    # Collision detected - push robots apart
+                    separation_dir = robot.gt_pos - other_robot.gt_pos
+                    if np.linalg.norm(separation_dir) < 1e-6:
+                        # Robots are exactly on top of each other - random separation
+                        angle = np.random.uniform(0, 2 * np.pi)
+                        separation_dir = np.array([np.cos(angle), np.sin(angle)])
+                    else:
+                        separation_dir = separation_dir / np.linalg.norm(separation_dir)
+                    
+                    # Push both robots apart to maintain minimum separation
+                    overlap = min_separation - dist_to_other
+                    push_distance = overlap / 2.0  # Split the push between both robots
+                    robot.gt_pos += separation_dir * push_distance
+                    other_robot.gt_pos -= separation_dir * push_distance
+                    
+                    # Also reduce velocities to prevent immediate re-collision
+                    robot.linear_vel *= 0.7  # Slow down
+                    other_robot.linear_vel *= 0.7  # Slow down
+        
+        # Phase 4: Check wall collisions for all robots
+        for robot in self.robots:
+            if not robot.is_active:
+                continue
+            
+            old_data = robot_old_positions.get(robot.id, {'pos': robot.gt_pos.copy(), 'angle': robot.gt_angle})
+            old_gt_pos = old_data['pos']
+            old_gt_angle = old_data['angle']
+            
+            # Check for wall collisions on GROUND TRUTH position
+            if self.use_maze and self.maze_walls:
+                # Check if new ground truth position collides with any wall
+                collision_detected = False
+                for wall_start, wall_end in self.maze_walls:
+                    if self._robot_wall_collision(robot.gt_pos, wall_start, wall_end, robot.radius):
+                        collision_detected = True
+                        # Revert ground truth to old position
+                        robot.gt_pos = old_gt_pos.copy()
+                        robot.gt_angle = old_gt_angle
+                        # Apply repulsion away from wall to prevent getting stuck
+                        closest = self._closest_point_on_segment(robot.gt_pos, wall_start, wall_end)
+                        repulsion_dir = robot.gt_pos - closest
+                        repulsion_dist = np.linalg.norm(repulsion_dir)
+                        if repulsion_dist < robot.radius + 0.1 and repulsion_dist > 1e-6:
+                            repulsion_dir = repulsion_dir / repulsion_dist
+                            # Push robot away from wall
+                            push_distance = (robot.radius + 0.15) - repulsion_dist
+                            robot.gt_pos += repulsion_dir * push_distance
+                        # Reduce velocity when hitting wall
+                        robot.linear_vel *= 0.5
+                        break
+            
+            # Update ESTIMATED position (mu) - this is what GPB localizes
+            # The estimated position should track ground truth but with errors that GPB corrects
+            # For now, update mu based on kinematics to track motion (GPB will correct errors)
+            # Use the same kinematics as ground truth but this represents the robot's belief
+            if abs(robot.angular_vel) > 1e-6:
+                # Arc motion
+                radius = robot.linear_vel / (robot.angular_vel + 1e-6)
+                dtheta = robot.angular_vel * self.dt
+                dx = radius * (np.sin(robot.angle + dtheta) - np.sin(robot.angle))
+                dy = radius * (-np.cos(robot.angle + dtheta) + np.cos(robot.angle))
+            else:
+                # Straight motion
+                dx = robot.linear_vel * np.cos(robot.angle) * self.dt
+                dy = robot.linear_vel * np.sin(robot.angle) * self.dt
+            
+            robot.mu += np.array([dx, dy])
+            robot.angle += robot.angular_vel * self.dt
+            
+            # Update expected position for motion model
             robot.expected_pos = robot.mu.copy()
+            
+            # Sync visualization angle with ground truth
+            robot.angle = robot.gt_angle
             
             # Update paths (limit to 200 for cleaner visualization)
             self.robot_paths[robot.id].append(robot.mu.copy())
             self.robot_gt_paths[robot.id].append(robot.gt_pos.copy())
-            if len(self.robot_paths[robot.id]) > 200:
+            # Keep more path history for better coverage visualization
+            if len(self.robot_paths[robot.id]) > 1000:
                 self.robot_paths[robot.id].pop(0)
-            if len(self.robot_gt_paths[robot.id]) > 200:
+            if len(self.robot_gt_paths[robot.id]) > 1000:
                 self.robot_gt_paths[robot.id].pop(0)
+            
+            # Update coverage map based on ground truth position
+            self._update_coverage_grid(robot.gt_pos, robot.radius)
         
         # Perform GBP iterations (GPB for robot-to-robot observations)
         if self.iter_count % self.iter_before_motion == 0:
@@ -896,25 +1378,82 @@ class RobotWebGUI(QMainWindow):
                     messages_received += 1
                 
                 # 2. LANDMARK OBSERVATIONS (if enabled)
+                # Use GA to select optimal landmarks if enabled
+                landmark_indices_to_observe = None
+                if self.use_ga_landmark_selection and self.num_landmarks > 1:
+                    # Run GA to select optimal landmarks for this robot
+                    # Only recompute every few iterations to save computation
+                    if robot.id not in self.robot_selected_landmarks or self.iter_count % 10 == 0:
+                        try:
+                            selected, fitness_history = select_optimal_landmarks(
+                                robot.mu,
+                                self.landmarks[:self.num_landmarks],
+                                self.sensor_range,
+                                self.maze_walls if self.use_maze else None,
+                                max_selected=self.ga_max_selected,
+                                ga_generations=self.ga_generations,
+                                track_history=True
+                            )
+                            self.robot_selected_landmarks[robot.id] = selected
+                            # Store fitness history for plotting
+                            if fitness_history:
+                                self.ga_evolution_data[robot.id] = fitness_history
+                            if self.debug_console and self.iter_count % 50 == 0:
+                                print(f"[GA] {robot.name} selected landmarks: {selected}")
+                        except Exception as e:
+                            if self.debug_console:
+                                print(f"[GA Error] {robot.name}: {e}")
+                            # Fallback: select all visible landmarks
+                            selected = list(range(min(self.ga_max_selected, self.num_landmarks)))
+                            self.robot_selected_landmarks[robot.id] = selected
+                    landmark_indices_to_observe = self.robot_selected_landmarks.get(robot.id, None)
+                
                 if self.use_landmark_only:
+                    # Observe all landmarks in range (or GA-selected if enabled)
                     for lm_idx, landmark_pos in enumerate(self.landmarks[:self.num_landmarks]):
-                        dist = np.linalg.norm(robot.mu - landmark_pos)  # Use estimated position
-                        if dist < self.sensor_range:
-                            angle = np.arctan2(robot.mu[1] - landmark_pos[1],
-                                             robot.mu[0] - landmark_pos[0])
-                            measurement = np.array([dist, angle]) + np.random.normal(0, self.noise_std[0], 2)
+                        # Skip if GA selection is active and this landmark not selected
+                        if landmark_indices_to_observe is not None and lm_idx not in landmark_indices_to_observe:
+                            continue
+                        
+                        # Check if landmark is in range using GROUND TRUTH position (actual physical distance)
+                        dist_gt = np.linalg.norm(robot.gt_pos - landmark_pos)
+                        if dist_gt < self.sensor_range:
+                            # Check line-of-sight if maze is enabled (using ground truth position)
+                            if self.use_maze and self.maze_walls:
+                                from ga_landmark_selector import LandmarkSelectorGA
+                                ga_temp = LandmarkSelectorGA()
+                                if not ga_temp._check_line_of_sight(robot.gt_pos, landmark_pos, self.maze_walls):
+                                    continue  # Landmark blocked by wall
+                            
+                            # Generate measurement from ground truth position (actual observation)
+                            angle_gt = np.arctan2(robot.gt_pos[1] - landmark_pos[1],
+                                                 robot.gt_pos[0] - landmark_pos[0])
+                            measurement = np.array([dist_gt, angle_gt]) + np.random.normal(0, self.noise_std[0], 2)
                             message = robot.get_local_message(landmark_pos, measurement, self.noise_std, self.is_robust)
                             robot.inbox[f'landmark_{lm_idx}'] = message
                             messages_received += 1
-                            message_details.append(f"  {robot.name}: received from landmark {lm_idx+1} (dist={dist:.2f})")
+                            message_details.append(f"  {robot.name}: received from landmark {lm_idx+1} (dist={dist_gt:.2f})")
                 else:
                     # Include landmark messages even when not in landmark-only mode
                     for lm_idx, landmark_pos in enumerate(self.landmarks[:self.num_landmarks]):
-                        dist = np.linalg.norm(robot.mu - landmark_pos)
-                        if dist < self.sensor_range:
-                            angle = np.arctan2(robot.mu[1] - landmark_pos[1],
-                                             robot.mu[0] - landmark_pos[0])
-                            measurement = np.array([dist, angle]) + np.random.normal(0, self.noise_std[0], 2)
+                        # Skip if GA selection is active and this landmark not selected
+                        if landmark_indices_to_observe is not None and lm_idx not in landmark_indices_to_observe:
+                            continue
+                        
+                        # Check if landmark is in range using GROUND TRUTH position (actual physical distance)
+                        dist_gt = np.linalg.norm(robot.gt_pos - landmark_pos)
+                        if dist_gt < self.sensor_range:
+                            # Check line-of-sight if maze is enabled (using ground truth position)
+                            if self.use_maze and self.maze_walls:
+                                from ga_landmark_selector import LandmarkSelectorGA
+                                ga_temp = LandmarkSelectorGA()
+                                if not ga_temp._check_line_of_sight(robot.gt_pos, landmark_pos, self.maze_walls):
+                                    continue  # Landmark blocked by wall
+                            
+                            # Generate measurement from ground truth position (actual observation)
+                            angle_gt = np.arctan2(robot.gt_pos[1] - landmark_pos[1],
+                                                 robot.gt_pos[0] - landmark_pos[0])
+                            measurement = np.array([dist_gt, angle_gt]) + np.random.normal(0, self.noise_std[0], 2)
                             message = robot.get_local_message(landmark_pos, measurement, self.noise_std, self.is_robust)
                             robot.inbox[f'landmark_{lm_idx}'] = message
                             messages_received += 1
@@ -969,28 +1508,33 @@ class RobotWebGUI(QMainWindow):
                                 
                                 # Only send message if not dropped or delayed
                                 if not message_dropped and not message_delayed:
-                                    # Generate measurement from robot's perspective observing neighbor
-                                    # This measurement represents: "I see neighbor at distance r and angle"
-                                    dx = neighbor.mu[0] - robot.mu[0]
-                                    dy = neighbor.mu[1] - robot.mu[1]
-                                    r = np.sqrt(dx**2 + dy**2)
-                                    angle = np.arctan2(dy, dx)
+                                    # Generate measurement from robot's GROUND TRUTH position observing neighbor's GROUND TRUTH position
+                                    # This measurement represents: "I see neighbor at distance r and angle" (actual physical observation)
+                                    dx_gt = neighbor.gt_pos[0] - robot.gt_pos[0]
+                                    dy_gt = neighbor.gt_pos[1] - robot.gt_pos[1]
+                                    r_gt = np.sqrt(dx_gt**2 + dy_gt**2)
                                     
-                                    # Add sensor noise (sometimes with outliers for robust testing)
-                                    if self.is_robust and np.random.random() < 0.05:  # 5% outlier rate
-                                        measurement = np.array([r, angle]) + np.random.normal(0, self.noise_std[0] * 5, 2)
-                                    else:
-                                        measurement = np.array([r, angle]) + np.random.normal(0, self.noise_std[0], 2)
-                                    
-                                    # Neighbor creates message containing its state (position information)
-                                    # This message says: "Based on your observation of me, here's information about my position"
-                                    message = neighbor.get_local_message(robot.mu, measurement, self.noise_std, self.is_robust)
-                                    robot.inbox[neighbor.id] = message
-                                    messages_received += 1
-                                    
-                                    # For logging
-                                    dist_gt = np.linalg.norm(robot.gt_pos - neighbor.gt_pos)
-                                    message_details.append(f"  {robot.name}: received from {neighbor.name} (est_dist={dist_estimated:.2f}, gt_dist={dist_gt:.2f})")
+                                    # Check if actually in range (using ground truth)
+                                    if r_gt < self.sensor_range:
+                                        # Generate measurement from ground truth positions (actual observation)
+                                        angle_gt = np.arctan2(dy_gt, dx_gt)
+                                        
+                                        # Add sensor noise (sometimes with outliers for robust testing)
+                                        if self.is_robust and np.random.random() < 0.05:  # 5% outlier rate
+                                            measurement = np.array([r_gt, angle_gt]) + np.random.normal(0, self.noise_std[0] * 5, 2)
+                                        else:
+                                            measurement = np.array([r_gt, angle_gt]) + np.random.normal(0, self.noise_std[0], 2)
+                                        
+                                        # Neighbor creates message containing its state (position information)
+                                        # This message says: "Based on your observation of me, here's information about my position"
+                                        # Use estimated position for linearization point in message
+                                        message = neighbor.get_local_message(robot.mu, measurement, self.noise_std, self.is_robust)
+                                        robot.inbox[neighbor.id] = message
+                                        messages_received += 1
+                                        
+                                        # For logging
+                                        dist_gt = np.linalg.norm(robot.gt_pos - neighbor.gt_pos)
+                                        message_details.append(f"  {robot.name}: received from {neighbor.name} (est_dist={dist_estimated:.2f}, gt_dist={dist_gt:.2f})")
                                 elif message_dropped:
                                     message_details.append(f"  {robot.name}: message from {neighbor.name} DROPPED (packet loss)")
                                 elif message_delayed:
@@ -1148,18 +1692,228 @@ class RobotWebGUI(QMainWindow):
         self.iter_count += 1
         self.update_status_display()
         self.update_plot()
+    
+    def draw_robot_sensor_view(self):
+        """Draw what a selected robot sees from its perspective."""
+        if self.ax_sensor is None:
+            if self.debug_console:
+                print(f"[Sensor View] ax_sensor is None, cannot draw")
+            return
+        
+        if self.selected_robot_for_view >= len(self.robots):
+            if self.debug_console:
+                print(f"[Sensor View] Invalid robot ID: {self.selected_robot_for_view} (max: {len(self.robots)-1})")
+            return
+        
+        robot = self.robots[self.selected_robot_for_view]
+        if not robot.is_active:
+            if self.debug_console:
+                print(f"[Sensor View] Robot {self.selected_robot_for_view} is not active")
+            return
+        
+        self.ax_sensor.clear()
+        self.ax_sensor.set_aspect('equal')
+        
+        # Center view on robot
+        center = robot.mu
+        view_range = self.sensor_range * 1.2
+        
+        # Draw sensor range circle
+        sensor_circle = plt.Circle(center, self.sensor_range, fill=False, 
+                                  linestyle='--', color='gray', linewidth=2, alpha=0.5)
+        self.ax_sensor.add_patch(sensor_circle)
+        
+        # Draw robot at center
+        self.ax_sensor.plot(center[0], center[1], 'ro', markersize=15, 
+                          label=f'{robot.name}', zorder=100)
+        # Draw robot orientation arrow
+        arrow_length = 1.5
+        dx = arrow_length * np.cos(robot.angle)
+        dy = arrow_length * np.sin(robot.angle)
+        self.ax_sensor.arrow(center[0], center[1], dx, dy, 
+                           head_width=0.5, head_length=0.4, fc='red', ec='red', zorder=101)
+        
+        # Draw visible landmarks
+        visible_landmarks = []
+        for lm_idx, landmark_pos in enumerate(self.landmarks[:self.num_landmarks]):
+            dist = np.linalg.norm(robot.mu - landmark_pos)
+            if dist < self.sensor_range:
+                # Check line-of-sight if maze enabled
+                visible = True
+                if self.use_maze and self.maze_walls:
+                    from ga_landmark_selector import LandmarkSelectorGA
+                    ga_temp = LandmarkSelectorGA()
+                    visible = ga_temp._check_line_of_sight(robot.mu, landmark_pos, self.maze_walls)
+                
+                if visible:
+                    # Check if GA-selected
+                    is_selected = False
+                    if self.use_ga_landmark_selection:
+                        if robot.id in self.robot_selected_landmarks:
+                            is_selected = lm_idx in self.robot_selected_landmarks[robot.id]
+                    
+                    color = 'gold' if is_selected else 'black'
+                    self.ax_sensor.plot(landmark_pos[0], landmark_pos[1], 's', 
+                                      markersize=10, color=color, 
+                                      markeredgecolor='orange' if is_selected else 'white',
+                                      markeredgewidth=2, zorder=50)
+                    # Draw line to landmark
+                    self.ax_sensor.plot([center[0], landmark_pos[0]], 
+                                      [center[1], landmark_pos[1]], 
+                                      'r--', alpha=0.5, linewidth=1.5, zorder=40)
+                    self.ax_sensor.text(landmark_pos[0] + 0.5, landmark_pos[1] + 0.5,
+                                       f'L{lm_idx+1}', fontsize=8, fontweight='bold',
+                                       bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7),
+                                       zorder=51)
+                    visible_landmarks.append((lm_idx, landmark_pos, is_selected))
+        
+        # Draw visible robots
+        for other_robot in self.robots:
+            if other_robot.id == robot.id or not other_robot.is_active:
+                continue
+            dist = np.linalg.norm(robot.mu - other_robot.mu)
+            if dist < self.sensor_range:
+                # Check if in inbox (actually communicating)
+                is_communicating = other_robot.id in robot.inbox
+                color = 'green' if is_communicating else 'blue'
+                self.ax_sensor.plot(other_robot.mu[0], other_robot.mu[1], 'o', 
+                                  markersize=10, color=color, 
+                                  markeredgecolor='darkgreen' if is_communicating else 'darkblue',
+                                  markeredgewidth=2, zorder=50)
+                # Draw line to other robot
+                line_style = 'g-' if is_communicating else 'b--'
+                self.ax_sensor.plot([center[0], other_robot.mu[0]], 
+                                  [center[1], other_robot.mu[1]], 
+                                  line_style, alpha=0.6, linewidth=2, zorder=40)
+                self.ax_sensor.text(other_robot.mu[0] + 0.5, other_robot.mu[1] + 0.5,
+                                   other_robot.name, fontsize=7, fontweight='bold',
+                                   bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7),
+                                   zorder=51)
+        
+        # Draw obstacles in range
+        for obs_pos in self.obstacles:
+            dist = np.linalg.norm(robot.mu - obs_pos)
+            if dist < self.sensor_range:
+                obstacle_circle = plt.Circle(obs_pos, self.obstacle_radius, 
+                                          fill=True, color='red', alpha=0.4, 
+                                          edgecolor='darkred', linewidth=2, zorder=30)
+                self.ax_sensor.add_patch(obstacle_circle)
+        
+        # Draw maze walls in view
+        if self.use_maze and self.maze_walls:
+            for wall_start, wall_end in self.maze_walls:
+                # Check if wall is in view
+                wall_center = (wall_start + wall_end) / 2
+                if np.linalg.norm(robot.mu - wall_center) < view_range:
+                    self.ax_sensor.plot([wall_start[0], wall_end[0]], 
+                                      [wall_start[1], wall_end[1]], 
+                                      'k-', linewidth=3, alpha=0.8, zorder=20)
+        
+        # Set view limits
+        self.ax_sensor.set_xlim(center[0] - view_range, center[0] + view_range)
+        self.ax_sensor.set_ylim(center[1] - view_range, center[1] + view_range)
+        self.ax_sensor.set_xlabel('X', fontsize=9)
+        self.ax_sensor.set_ylabel('Y', fontsize=9)
+        self.ax_sensor.set_title(f'{robot.name} Sensor View\n'
+                               f'Landmarks: {len(visible_landmarks)} visible, '
+                               f'{sum(1 for _, _, sel in visible_landmarks if sel)} GA-selected',
+                               fontsize=9, fontweight='bold')
+        self.ax_sensor.grid(True, alpha=0.3)
+        
+        # Add legend
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, label='This Robot'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='green', markersize=8, label='Communicating Robot'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', markersize=8, label='Visible Robot'),
+            Line2D([0], [0], marker='s', color='w', markerfacecolor='gold', markersize=8, label='GA-Selected Landmark'),
+            Line2D([0], [0], marker='s', color='w', markerfacecolor='black', markersize=8, label='Visible Landmark'),
+        ]
+        self.ax_sensor.legend(handles=legend_elements, loc='upper right', fontsize=7)
         
         if self.step_by_step:
             self.running = False
             self.run_cb.setChecked(False)
 
     def update_plot(self):
+        # Initialize figure if needed or recreate if layout changed
+        needs_recreate = False
+        if self.fig is None:
+            needs_recreate = True
+        # Sensor view disabled
+        # elif self.show_robot_sensor_view and self.ax_sensor is None:
+        #     needs_recreate = True
+        # elif not self.show_robot_sensor_view and self.ax_sensor is not None:
+        #     needs_recreate = True
+        elif self.use_ga_landmark_selection and self.ax_ga is None:
+            needs_recreate = True
+        elif not self.use_ga_landmark_selection and self.ax_ga is not None:
+            needs_recreate = True
+        
+        if needs_recreate:
+            old_fig = self.fig
+            if old_fig is not None:
+                plt.close(old_fig)
+            
+            # Sensor view disabled - simplified layout
+            # if self.show_robot_sensor_view:
+            #     # With sensor view: 2x2 grid, main plot, GPB, sensor view, and optionally GA
+            #     if self.use_ga_landmark_selection:
+            #         self.fig = plt.figure(figsize=(20, 10))
+            #         gs = self.fig.add_gridspec(3, 2, height_ratios=[2, 1, 1], width_ratios=[2, 1], 
+            #                                   hspace=0.3, wspace=0.3, 
+            #                                   left=0.05, right=0.95, top=0.95, bottom=0.05)
+            #         self.ax = self.fig.add_subplot(gs[0, 0])
+            #         self.ax_gpb = self.fig.add_subplot(gs[1, 0])
+            #         self.ax_ga = self.fig.add_subplot(gs[2, 0])
+            #         self.ax_sensor = self.fig.add_subplot(gs[0:3, 1])
+            #     else:
+            #         self.fig = plt.figure(figsize=(18, 10))
+            #         gs = self.fig.add_gridspec(2, 2, height_ratios=[2, 1], width_ratios=[2, 1], 
+            #                                   hspace=0.3, wspace=0.3, 
+            #                                   left=0.05, right=0.95, top=0.95, bottom=0.05)
+            #         self.ax = self.fig.add_subplot(gs[0, 0])
+            #         self.ax_gpb = self.fig.add_subplot(gs[1, 0])
+            #         self.ax_ga = None
+            #         self.ax_sensor = self.fig.add_subplot(gs[0:2, 1])
+            #     if self.debug_console:
+            #         print(f"[Sensor View] Created sensor view panel")
+            # Simplified layout - no sensor view
+            # Without sensor view: 2 or 3 rows depending on GA
+            if self.use_ga_landmark_selection:
+                self.fig = plt.figure(figsize=(14, 12))
+                gs = self.fig.add_gridspec(3, 1, height_ratios=[2, 1, 1], hspace=0.3,
+                                      left=0.05, right=0.70, top=0.95, bottom=0.05)
+                self.ax = self.fig.add_subplot(gs[0, 0])
+                self.ax_gpb = self.fig.add_subplot(gs[1, 0])
+                self.ax_ga = self.fig.add_subplot(gs[2, 0])
+                self.ax_sensor = None
+                if self.debug_console:
+                    print(f"[GA] Created GA evolution plot")
+            else:
+                self.fig = plt.figure(figsize=(14, 10))
+                gs = self.fig.add_gridspec(2, 1, height_ratios=[2, 1], hspace=0.3,
+                                      left=0.05, right=0.70, top=0.95, bottom=0.05)
+                self.ax = self.fig.add_subplot(gs[0, 0])
+                self.ax_gpb = self.fig.add_subplot(gs[1, 0])
+                self.ax_ga = None
+                self.ax_sensor = None
+                if self.debug_console:
+                    print(f"[Layout] Created standard layout")
+            
+            # Update canvas - force immediate update
+            if hasattr(self, 'canvas'):
+                self.canvas.figure = self.fig
+                self.canvas.draw()  # Force immediate draw when layout changes
+                if self.debug_console:
+                    print(f"[Sensor View] Canvas updated")
+        
         self.ax.clear()
         
         # Determine view limits
         if self.follow_robot and 0 <= self.robot_id_to_follow < len(self.robots):
             center_robot = self.robots[self.robot_id_to_follow]
-            center = center_robot.mu
+            center = center_robot.gt_pos  # Follow ground truth position (where robot actually is)
             view_range = self.boundary_radius + 2
             self.ax.set_xlim(center[0] - view_range, center[0] + view_range)
             self.ax.set_ylim(center[1] - view_range, center[1] + view_range)
@@ -1168,29 +1922,91 @@ class RobotWebGUI(QMainWindow):
             self.ax.set_xlim(-view_range, view_range)
             self.ax.set_ylim(-view_range, view_range)
         
+        # Draw coverage map FIRST (background layer) - shows where robots have been
+        if self.show_coverage_map and self.coverage_grid is not None:
+            try:
+                x_min, x_max, y_min, y_max = self.coverage_grid_bounds
+                extent = [x_min, x_max, y_min, y_max]
+                # Use a colormap that shows visited areas (green/yellow for visited, transparent for unvisited)
+                coverage_alpha = 0.25  # Transparency
+                # Create a custom colormap: transparent for 0, green for visited
+                from matplotlib.colors import LinearSegmentedColormap
+                colors_list = [(0, 0, 0, 0), (0.2, 0.8, 0.2, 0.6), (0.4, 1.0, 0.4, 0.8)]  # Transparent -> Light green -> Bright green
+                n_bins = 100
+                cmap = LinearSegmentedColormap.from_list('coverage', colors_list, N=n_bins)
+                im = self.ax.imshow(self.coverage_grid, extent=extent, origin='lower',
+                                  cmap=cmap, alpha=coverage_alpha, vmin=0, vmax=1,
+                                  interpolation='bilinear', zorder=0)
+            except Exception as e:
+                if self.debug_console:
+                    print(f"[Coverage] Error drawing coverage map: {e}")
+        
+        # Draw maze walls (immediately after coverage map) so they're always visible
+        if self.use_maze:
+            # Always ensure maze is initialized when enabled
+            if len(self.maze_walls) == 0:
+                if self.debug_console:
+                    print(f"[Maze] Maze enabled but no walls! Initializing...")
+                self.init_maze()  # Reinitialize
+                if self.debug_console and len(self.maze_walls) > 0:
+                    print(f"[Maze] Initialized {len(self.maze_walls)} walls")
+            
+            # Draw walls if we have them
+            if len(self.maze_walls) > 0:
+                maze_wall_label_drawn = False
+                for i, (wall_start, wall_end) in enumerate(self.maze_walls):
+                    # Draw wall with thick black line
+                    # Use zorder=3 to be above background/obstacles but below robots
+                    # Use clip_on=False to ensure walls are always visible even at edges
+                    try:
+                        # Convert numpy arrays to lists for matplotlib compatibility
+                        x_coords = [float(wall_start[0]), float(wall_end[0])]
+                        y_coords = [float(wall_start[1]), float(wall_end[1])]
+                        
+                        # Draw wall with appropriate thickness
+                        self.ax.plot(x_coords, y_coords, 
+                                   'k-', linewidth=8, alpha=1.0, 
+                                   label='Maze Wall' if not maze_wall_label_drawn else '',
+                                   zorder=3, solid_capstyle='round', clip_on=False)
+                        maze_wall_label_drawn = True
+                    except Exception as e:
+                        if self.debug_console:
+                            print(f"[Maze Error] Failed to draw wall {i}: {e}")
+                            import traceback
+                            traceback.print_exc()
+            else:
+                # Debug: if still no walls, print warning
+                if self.debug_console:
+                    print(f"[Maze Error] use_maze=True but maze_walls is empty after init_maze()!")
+                    print(f"[Maze Error] boundary_radius={self.boundary_radius}, use_maze={self.use_maze}")
+                    print(f"[Maze Error] maze_walls type: {type(self.maze_walls)}, length: {len(self.maze_walls)}")
+        
         # Draw boundary circle
         boundary_circle = plt.Circle(self.circle_center, self.boundary_radius, 
                                     fill=False, linestyle='--', color='red', 
-                                    alpha=0.3, linewidth=2, label='Boundary')
+                                    alpha=0.3, linewidth=2, label='Boundary', zorder=2)
         self.ax.add_patch(boundary_circle)
         
         # Draw paths (with limited length for cleaner visualization)
+        # Draw GROUND TRUTH paths (where robots actually traveled) - these mark where robots have been
         if self.show_path:
             colors = plt.cm.tab10(np.linspace(0, 1, len(self.robots)))
             for i, robot in enumerate(self.robots):
-                if len(self.robot_paths[robot.id]) > 1:
-                    path = np.array(self.robot_paths[robot.id])
-                    # Only show last 200 points for cleaner visualization
-                    if len(path) > 200:
-                        path = path[-200:]
+                if len(self.robot_gt_paths[robot.id]) > 1:
+                    path = np.array(self.robot_gt_paths[robot.id])
+                    # Show more path history for better coverage visualization
+                    # Show last 500 points (or all if less than 500)
+                    if len(path) > 500:
+                        path = path[-500:]
                     self.ax.plot(path[:, 0], path[:, 1], '-', color=colors[i], 
-                               alpha=0.4, linewidth=1.5, label=f"{robot.name} path")
+                               alpha=0.6, linewidth=2.0, label=f"{robot.name} GT path", zorder=1)
         
         # Draw sensor ranges (visualize detection range) for all robots
+        # Draw at ground truth position (where robot actually is)
         if self.show_factors:
             sensor_range_label_added = False
             for robot in self.robots:
-                sensor_circle = plt.Circle(robot.mu, self.sensor_range, 
+                sensor_circle = plt.Circle(robot.gt_pos, self.sensor_range, 
                                          fill=False, linestyle=':', color='gray', 
                                          alpha=0.25, linewidth=1.5, zorder=2,
                                          label='Sensor Range' if not sensor_range_label_added else '')
@@ -1198,9 +2014,10 @@ class RobotWebGUI(QMainWindow):
                 sensor_range_label_added = True
         
         # Draw inter-robot communication (GPB messages) - GREEN lines like reference
+        # Draw based on GROUND TRUTH positions (actual physical locations)
         inter_robot_connections_drawn = False
         if self.show_factors:
-            # Draw connections based on current robot positions and sensor range
+            # Draw connections based on current robot GROUND TRUTH positions and sensor range
             # Check all pairs of robots to see if they're within communication range
             drawn_pairs = set()  # Track which pairs we've already drawn to avoid duplicates
             for i, robot1 in enumerate(self.robots):
@@ -1210,27 +2027,28 @@ class RobotWebGUI(QMainWindow):
                     if i >= j or not robot2.is_active:
                         continue
                     
-                    # Check if robots are within sensor range
-                    dist = np.linalg.norm(robot1.mu - robot2.mu)
-                    if dist < self.sensor_range:
+                    # Check if robots are within sensor range (using ground truth positions)
+                    dist_gt = np.linalg.norm(robot1.gt_pos - robot2.gt_pos)
+                    if dist_gt < self.sensor_range:
                         # Create unique pair identifier
                         pair_id = tuple(sorted([robot1.id, robot2.id]))
                         if pair_id not in drawn_pairs:
                             drawn_pairs.add(pair_id)
                             
                             # Green solid lines for inter-robot communication (matching reference)
-                            mid_x = (robot1.mu[0] + robot2.mu[0]) / 2
-                            mid_y = (robot1.mu[1] + robot2.mu[1]) / 2
-                            self.ax.plot([robot1.mu[0], robot2.mu[0]],
-                                       [robot1.mu[1], robot2.mu[1]],
+                            # Draw between ground truth positions (actual physical locations)
+                            mid_x = (robot1.gt_pos[0] + robot2.gt_pos[0]) / 2
+                            mid_y = (robot1.gt_pos[1] + robot2.gt_pos[1]) / 2
+                            self.ax.plot([robot1.gt_pos[0], robot2.gt_pos[0]],
+                                       [robot1.gt_pos[1], robot2.gt_pos[1]],
                                        'g-', alpha=0.7, linewidth=2.5,
                                        label='Inter-robot Communication' if not inter_robot_connections_drawn else '', zorder=4)
                             # Add small arrow in middle to show communication direction
-                            dx = robot2.mu[0] - robot1.mu[0]
-                            dy = robot2.mu[1] - robot1.mu[1]
-                            if dist > 0.5:
-                                arrow_dx = dx / dist * 0.4
-                                arrow_dy = dy / dist * 0.4
+                            dx = robot2.gt_pos[0] - robot1.gt_pos[0]
+                            dy = robot2.gt_pos[1] - robot1.gt_pos[1]
+                            if dist_gt > 0.5:
+                                arrow_dx = dx / dist_gt * 0.4
+                                arrow_dy = dy / dist_gt * 0.4
                                 self.ax.arrow(mid_x - arrow_dx/2, mid_y - arrow_dy/2,
                                             arrow_dx, arrow_dy,
                                             head_width=0.25, head_length=0.2,
@@ -1238,6 +2056,7 @@ class RobotWebGUI(QMainWindow):
                             inter_robot_connections_drawn = True
             
             # Also show connections from inbox (current messages)
+            # Draw from GROUND TRUTH positions (where robots actually are)
             for i, robot in enumerate(self.robots):
                 if self.show_only_landmark_factors:
                     # Only show landmark connections
@@ -1246,8 +2065,8 @@ class RobotWebGUI(QMainWindow):
                             lm_idx = int(neighbor_id.split('_')[1])
                             if lm_idx < len(self.landmarks):
                                 landmark_pos = self.landmarks[lm_idx]
-                                self.ax.plot([robot.mu[0], landmark_pos[0]],
-                                           [robot.mu[1], landmark_pos[1]],
+                                self.ax.plot([robot.gt_pos[0], landmark_pos[0]],
+                                           [robot.gt_pos[1], landmark_pos[1]],
                                            'r--', alpha=0.3, linewidth=0.8)
                 else:
                     # Show range-bearing measurements (red lines) - the actual observations
@@ -1256,33 +2075,78 @@ class RobotWebGUI(QMainWindow):
                             lm_idx = int(neighbor_id.split('_')[1])
                             if lm_idx < len(self.landmarks):
                                 landmark_pos = self.landmarks[lm_idx]
-                                self.ax.plot([robot.mu[0], landmark_pos[0]],
-                                           [robot.mu[1], landmark_pos[1]],
+                                self.ax.plot([robot.gt_pos[0], landmark_pos[0]],
+                                           [robot.gt_pos[1], landmark_pos[1]],
                                            'r--', alpha=0.4, linewidth=1.0,
                                            label='Range-Bearing Measurements' if i == 0 and lm_idx == 0 else '')
             
             # Visualize message queues (show robots with queued messages)
+            # Draw at GROUND TRUTH positions (where robots actually are)
             for robot in self.robots:
                 queue_size = self.message_queue_sizes.get(robot.id, 0)
                 if queue_size > 0:
                     # Draw a small indicator showing queued messages
-                    self.ax.plot(robot.mu[0] + 1.2, robot.mu[1] + 1.2, 'ro', 
+                    self.ax.plot(robot.gt_pos[0] + 1.2, robot.gt_pos[1] + 1.2, 'ro', 
                                markersize=8 + queue_size * 2, alpha=0.5, zorder=8)
-                    self.ax.text(robot.mu[0] + 1.2, robot.mu[1] + 1.2, 
+                    self.ax.text(robot.gt_pos[0] + 1.2, robot.gt_pos[1] + 1.2, 
                                f'Q:{queue_size}', fontsize=7, ha='center', va='center',
                                bbox=dict(boxstyle='round,pad=0.2', facecolor='yellow', alpha=0.7), zorder=9)
         
+        # Maze walls already drawn above (right after clear)
+        
         # Draw landmarks (black squares, distinct from robot ground truth stars)
+        # First, draw connections from robots to their GA-selected landmarks
+        # Draw from GROUND TRUTH positions (where robots actually are)
+        if self.use_ga_landmark_selection:
+            for robot in self.robots:
+                if robot.id in self.robot_selected_landmarks:
+                    selected_indices = self.robot_selected_landmarks[robot.id]
+                    for lm_idx in selected_indices:
+                        if lm_idx < len(self.landmarks):
+                            landmark_pos = self.landmarks[lm_idx]
+                            # Draw thick orange line from robot to GA-selected landmark
+                            self.ax.plot([robot.gt_pos[0], landmark_pos[0]], 
+                                       [robot.gt_pos[1], landmark_pos[1]], 
+                                       'o-', color='orange', linewidth=3, alpha=0.6,
+                                       markersize=0, zorder=9,
+                                       label='GA-Selected Landmark Connection' if robot is self.robots[0] and lm_idx == selected_indices[0] else '')
+        
         for lm_idx, landmark_pos in enumerate(self.landmarks[:self.num_landmarks]):
+            # Highlight GA-selected landmarks
+            is_ga_selected = False
+            selected_by_robots = []
+            if self.use_ga_landmark_selection:
+                for robot in self.robots:
+                    if robot.id in self.robot_selected_landmarks:
+                        if lm_idx in self.robot_selected_landmarks[robot.id]:
+                            is_ga_selected = True
+                            selected_by_robots.append(robot)
+                            break
+            
+            # Use different color for GA-selected landmarks
+            if is_ga_selected:
+                marker_color = 'gold'
+                marker_edge = 'orange'
+                marker_size = 15  # Larger for GA-selected
+            else:
+                marker_color = 'black'
+                marker_edge = 'white'
+                marker_size = 12
+            
             label = "Landmark" if lm_idx == 0 else None
-            self.ax.plot(landmark_pos[0], landmark_pos[1], 'ks', 
-                        markersize=12, markeredgewidth=2, 
-                        markerfacecolor='black', markeredgecolor='white',
+            self.ax.plot(landmark_pos[0], landmark_pos[1], 's', 
+                        markersize=marker_size, markeredgewidth=3 if is_ga_selected else 2, 
+                        markerfacecolor=marker_color, markeredgecolor=marker_edge,
                         label=label, zorder=10)
-            # Add landmark number
+            # Add landmark number with GA indicator
+            label_text = f'L{lm_idx+1}'
+            if is_ga_selected:
+                label_text += ' (GA)'
             self.ax.text(landmark_pos[0] + 0.5, landmark_pos[1] + 0.5, 
-                        f'L{lm_idx+1}', fontsize=8, color='black',
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7),
+                        label_text, fontsize=8, fontweight='bold' if is_ga_selected else 'normal',
+                        color='darkorange' if is_ga_selected else 'black',
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow' if is_ga_selected else 'white', 
+                                alpha=0.8, edgecolor='orange' if is_ga_selected else 'gray'),
                         zorder=11)
         
         # Draw obstacles
@@ -1295,22 +2159,36 @@ class RobotWebGUI(QMainWindow):
             self.ax.add_patch(obstacle_circle)
         
         # Draw robots (differential drive - Roomba-like)
+        # Draw at GROUND TRUTH position (where robot actually is)
         colors = plt.cm.tab10(np.linspace(0, 1, len(self.robots)))
         for i, robot in enumerate(self.robots):
             # Differential robots: circles with orientation arrows
-            self.ax.plot(robot.mu[0], robot.mu[1], 'o', color=colors[i], 
+            # Draw at ground truth position (actual physical location)
+            self.ax.plot(robot.gt_pos[0], robot.gt_pos[1], 'o', color=colors[i], 
                         markersize=10, markeredgecolor='black', markeredgewidth=1.5,
                         label=f"Robot {i+1}", zorder=5)
-            # Draw orientation arrow
+            # Draw orientation arrow based on ground truth angle
             arrow_length = 0.8
-            dx = arrow_length * np.cos(robot.angle)
-            dy = arrow_length * np.sin(robot.angle)
-            self.ax.arrow(robot.mu[0], robot.mu[1], dx, dy,
+            dx = arrow_length * np.cos(robot.gt_angle)
+            dy = arrow_length * np.sin(robot.gt_angle)
+            self.ax.arrow(robot.gt_pos[0], robot.gt_pos[1], dx, dy,
                         head_width=0.3, head_length=0.2, fc=colors[i], ec='black', zorder=6)
+            
+            # Optionally draw estimated position as a smaller circle to show localization error
+            if self.show_factors:
+                # Draw estimated position (mu) as a smaller, semi-transparent circle
+                self.ax.plot(robot.mu[0], robot.mu[1], 'o', color=colors[i], 
+                            markersize=6, alpha=0.5, zorder=4)
+                # Draw line from estimated to ground truth to show error
+                self.ax.plot([robot.mu[0], robot.gt_pos[0]], [robot.mu[1], robot.gt_pos[1]], 
+                            '--', color=colors[i], linewidth=1, alpha=0.3, zorder=3)
         
         self.ax.set_aspect('equal')
         self.ax.grid(True, alpha=0.3)
-        title = "Differential Drive Robots with RVO & GPB"
+        title = "Differential Drive Robots"
+        if self.use_rvo:
+            title += " with RVO"
+        title += " & GPB"
         if self.dropped_messages_count > 0:
             title += f" | Dropped: {self.dropped_messages_count}"
         self.ax.set_title(title, fontsize=12, fontweight='bold')
@@ -1372,35 +2250,87 @@ class RobotWebGUI(QMainWindow):
             # Position legend outside plot area to the right
             self.ax_gpb.legend(loc='center left', bbox_to_anchor=(1.02, 0.5),
                               fontsize=7, framealpha=0.9, fancybox=True, shadow=True)
+        
+        # Add current error as text
+        if self.gpb_error_history:
+            current_error = self.gpb_error_history[-1]
+            # Also show min/max
+            if self.last_update_stats:
+                current_errors = [stats['error'] for stats in self.last_update_stats.values()]
+                min_err = min(current_errors)
+                max_err = max(current_errors)
+                error_text = f'Avg: {current_error:.3f} | Min: {min_err:.3f} | Max: {max_err:.3f}'
+            else:
+                error_text = f'Current Error: {current_error:.3f}'
+            self.ax_gpb.text(0.02, 0.98, error_text, 
+                           transform=self.ax_gpb.transAxes, fontsize=8,
+                           verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        # Show convergence trend (improved logic)
+        if len(self.gpb_error_history) > 30:
+            # Use last 30 points for more stable trend detection
+            recent = self.gpb_error_history[-30:]
+            # Calculate trend: compare last 10 vs previous 10
+            recent_10 = recent[-10:]
+            previous_10 = recent[-20:-10] if len(recent) >= 20 else recent[:10]
             
-            # Add current error as text
-            if self.gpb_error_history:
-                current_error = self.gpb_error_history[-1]
-                # Also show min/max
-                if self.last_update_stats:
-                    current_errors = [stats['error'] for stats in self.last_update_stats.values()]
-                    min_err = min(current_errors)
-                    max_err = max(current_errors)
-                    error_text = f'Avg: {current_error:.3f} | Min: {min_err:.3f} | Max: {max_err:.3f}'
-                else:
-                    error_text = f'Current Error: {current_error:.3f}'
-                self.ax_gpb.text(0.02, 0.98, error_text, 
-                               transform=self.ax_gpb.transAxes, fontsize=8,
-                               verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            avg_recent = np.mean(recent_10)
+            avg_previous = np.mean(previous_10) if len(previous_10) > 0 else avg_recent
             
-            # Show convergence trend
-            if len(self.gpb_error_history) > 20:
-                recent = self.gpb_error_history[-20:]
-                if recent[-1] < recent[0]:
-                    trend = "Converging ✓"
-                    color = 'green'
+            # Consider converging if error decreased by at least 5%
+            if avg_recent < avg_previous * 0.95:
+                trend = "Converging ✓"
+                color = 'green'
+            elif avg_recent > avg_previous * 1.05:
+                trend = "Diverging ✗"
+                color = 'red'
+            else:
+                # Stable - show as converging if error is low
+                if avg_recent < 0.5:
+                    trend = "Stable ✓"
+                    color = 'blue'
                 else:
-                    trend = "Diverging ✗"
-                    color = 'red'
-                self.ax_gpb.text(0.98, 0.98, trend, transform=self.ax_gpb.transAxes, 
-                               fontsize=9, color=color, fontweight='bold',
-                               verticalalignment='top', horizontalalignment='right',
-                               bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+                    trend = "Stable"
+                    color = 'gray'
+            
+            self.ax_gpb.text(0.98, 0.98, trend, transform=self.ax_gpb.transAxes, 
+                           fontsize=9, color=color, fontweight='bold',
+                           verticalalignment='top', horizontalalignment='right',
+                           bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+        
+        # Update GA evolution plot if enabled
+        if self.use_ga_landmark_selection and self.ax_ga is not None:
+            self.ax_ga.clear()
+            has_data = False
+            colors = plt.cm.tab10(np.linspace(0, 1, max(10, len(self.robots))))
+            
+            for i, robot in enumerate(self.robots):
+                if robot.id in self.ga_evolution_data and len(self.ga_evolution_data[robot.id]) > 0:
+                    has_data = True
+                    generations = list(range(len(self.ga_evolution_data[robot.id])))
+                    best_fitness = [gen['best'] for gen in self.ga_evolution_data[robot.id]]
+                    avg_fitness = [gen['avg'] for gen in self.ga_evolution_data[robot.id]]
+                    
+                    # Plot best and average fitness
+                    self.ax_ga.plot(generations, best_fitness, '-', color=colors[i], 
+                                   linewidth=2, label=f'Robot {i+1} Best', alpha=0.8)
+                    self.ax_ga.plot(generations, avg_fitness, '--', color=colors[i], 
+                                   linewidth=1, label=f'Robot {i+1} Avg', alpha=0.5)
+            
+            if has_data:
+                self.ax_ga.set_xlabel("Generation", fontsize=10)
+                self.ax_ga.set_ylabel("Fitness", fontsize=10)
+                self.ax_ga.set_title("GA Evolution: Fitness Over Generations", fontsize=10, fontweight='bold')
+                self.ax_ga.grid(True, alpha=0.3)
+                self.ax_ga.legend(loc='best', fontsize=7, framealpha=0.9, fancybox=True, shadow=True)
+            else:
+                self.ax_ga.text(0.5, 0.5, 'No GA evolution data yet', 
+                               transform=self.ax_ga.transAxes,
+                               ha='center', va='center', fontsize=10, alpha=0.5)
+                self.ax_ga.set_xlabel("Generation", fontsize=10)
+                self.ax_ga.set_ylabel("Fitness", fontsize=10)
+                self.ax_ga.set_title("GA Evolution: Fitness Over Generations", fontsize=10, fontweight='bold')
+                self.ax_ga.grid(True, alpha=0.3)
         
         # Add author footer to GPB plot as well
         footer_text_gpb = "For educational purposes | Author: Thiwanka Jayasiri | Ref: arXiv:2202.03314"
@@ -1412,6 +2342,18 @@ class RobotWebGUI(QMainWindow):
                          zorder=100)
         
         self.canvas.draw()
+        
+        # Sensor view disabled - not working properly
+        # if self.show_robot_sensor_view and self.ax_sensor is not None:
+        #     try:
+        #         self.draw_robot_sensor_view()
+        #         # Redraw canvas to show sensor view
+        #         self.canvas.draw()
+        #     except Exception as e:
+        #         if self.debug_console:
+        #             print(f"[Sensor View Error] {e}")
+        #             import traceback
+        #             traceback.print_exc()
     
     def update_status_display(self):
         """Update the status display in the control panel."""
