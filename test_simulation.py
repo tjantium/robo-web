@@ -1,21 +1,23 @@
 import sys
 import os
-from typing import Any
+from typing import Any, Dict
 # Set Qt API before importing matplotlib
 os.environ['QT_API'] = 'pyqt6'
 import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QCheckBox, 
-                             QDoubleSpinBox, QSpinBox, QGroupBox, QScrollArea)
+                             QDoubleSpinBox, QSpinBox, QGroupBox, QScrollArea, QTabWidget)
 from PyQt6.QtCore import Qt, QTimer
 import matplotlib
 matplotlib.use('QtAgg')
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.patches import Circle as MplCircle
+from matplotlib import gridspec
 from robot_m import RobotAgent
 from rvo import RVO
 from ga_landmark_selector import LandmarkSelectorGA, select_optimal_landmarks
+from federated_ga import FederatedLearningGA
 
 class RobotWebGUI(QMainWindow):
     def __init__(self):
@@ -62,7 +64,9 @@ class RobotWebGUI(QMainWindow):
         self.obstacle_moving = True  # Whether obstacles move
         
         # Maze/Non-convex environment settings
-        self.use_maze = False  # Enable maze environment
+        # MAZE DISABLED - Commented out for federated learning focus
+        # self.use_maze = False  # Enable maze environment
+        self.use_maze = False  # Disabled for federated learning
         self.maze_walls = []  # List of wall segments: [(start, end), ...]
         self.maze_complexity = 5  # Number of walls in maze
         
@@ -73,6 +77,16 @@ class RobotWebGUI(QMainWindow):
         self.robot_selected_landmarks = {}  # {robot_id: [landmark_indices]}
         self.ga_fitness_history = []  # Track GA evolution: [{robot_id: [{'best': float, 'avg': float}, ...]}, ...]
         self.ga_evolution_data = {}  # {robot_id: [{'best': float, 'avg': float}, ...]} - latest evolution
+        
+        # Federated Learning tracking
+        self.federated_fitness_history = []  # Track FL GA fitness over rounds
+        self.federated_aggregation_weights_history = []  # Track aggregation weights over rounds
+        self.federated_client_selection_history = []  # Track which clients selected
+        self.federated_metrics_history = []  # Track diversity, fairness, quality metrics
+        
+        # SLAM visualization: Track observation history for factor graph
+        self.slam_observations = {}  # {robot_id: [(pose, landmark_idx, iteration), ...]}
+        self.show_slam_visualization = True  # Enable SLAM factor graph visualization
         
         # Technical goals settings
         self.use_odometry = True  # Each robot has odometry factors (local fragment)
@@ -135,7 +149,7 @@ class RobotWebGUI(QMainWindow):
         
         self.init_robots()
         self.init_obstacles()
-        self.init_maze()  # Initialize maze walls if enabled
+        # self.init_maze()  # Initialize maze walls if enabled - DISABLED
         
         # Robot sensor view visualization (DISABLED - not working properly)
         self.show_robot_sensor_view = False  # Toggle for sensor view panel
@@ -149,14 +163,17 @@ class RobotWebGUI(QMainWindow):
         control_panel = self.create_control_panel()
         main_layout.addWidget(control_panel, 0)
         
-        # Right panel - Visualization
-        viz_widget = QWidget()
-        viz_layout = QVBoxLayout(viz_widget)
+        # Right panel - Visualization with Tabs
+        self.tab_widget = QTabWidget()
+        
+        # Tab 1: Main Simulation (Simulation + GPB + GA Landmark Selection)
+        sim_tab = QWidget()
+        sim_layout = QVBoxLayout(sim_tab)
         
         # FPS label
         self.fps_label = QLabel("0 FPS")
         self.fps_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        viz_layout.addWidget(self.fps_label)
+        sim_layout.addWidget(self.fps_label)
         
         # Main simulation plot - will be initialized in update_plot based on sensor view toggle
         # Initialize with default layout (no sensor view)
@@ -169,9 +186,50 @@ class RobotWebGUI(QMainWindow):
         self.ax_sensor = None  # Will be created when sensor view is enabled
         
         self.canvas = FigureCanvas(self.fig)
-        viz_layout.addWidget(self.canvas)
+        sim_layout.addWidget(self.canvas)
         
-        main_layout.addWidget(viz_widget, 1)
+        self.tab_widget.addTab(sim_tab, "Simulation")
+        
+        # Tab 2: Federated Learning
+        fl_tab = QWidget()
+        fl_layout = QVBoxLayout(fl_tab)
+        
+        # Title for federated learning tab
+        fl_title = QLabel("Federated Learning (GA-Optimized)")
+        fl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        fl_title.setStyleSheet("font-size: 14pt; font-weight: bold; padding: 10px;")
+        fl_layout.addWidget(fl_title)
+        
+        # Federated learning plot - use subplots for better organization
+        self.fig_fl = plt.figure(figsize=(16, 10))
+        # Create a 2x2 grid of subplots for different metrics
+        gs_fl = self.fig_fl.add_gridspec(2, 2, hspace=0.35, wspace=0.3, 
+                                        left=0.08, right=0.95, top=0.93, bottom=0.08)
+        
+        # Subplot 1: GA Fitness Evolution (top left)
+        self.ax_fl_fitness = self.fig_fl.add_subplot(gs_fl[0, 0])
+        
+        # Subplot 2: Aggregation Weights over time (top right)
+        self.ax_fl_weights = self.fig_fl.add_subplot(gs_fl[0, 1])
+        
+        # Subplot 3: Metrics (Diversity, Fairness, Quality) (bottom left)
+        self.ax_fl_metrics = self.fig_fl.add_subplot(gs_fl[1, 0])
+        
+        # Subplot 4: Client Selection over rounds (bottom right)
+        self.ax_fl_clients = self.fig_fl.add_subplot(gs_fl[1, 1])
+        
+        self.canvas_fl = FigureCanvas(self.fig_fl)
+        fl_layout.addWidget(self.canvas_fl)
+        
+        # Status label for federated learning
+        self.fl_status_label = QLabel("Federated Learning: Disabled")
+        self.fl_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.fl_status_label.setStyleSheet("font-size: 10pt; padding: 5px;")
+        fl_layout.addWidget(self.fl_status_label)
+        
+        self.tab_widget.addTab(fl_tab, "Federated Learning")
+        
+        main_layout.addWidget(self.tab_widget, 1)
         
         self.setCentralWidget(main_widget)
         
@@ -207,10 +265,17 @@ class RobotWebGUI(QMainWindow):
         print("="*70 + "\n")
     
     def init_robots(self):
-        """Initialize robots: differential robots in a circle, car-like robot away from center."""
+        """Initialize robots: differential robots (Roomba) and drones for federated learning with non-IID data."""
         self.robots = []
         self.robot_paths = {}
         self.robot_gt_paths = {}
+        
+        # Federated learning setup (disabled by default - can be enabled via UI)
+        self.use_federated_learning = False  # Disabled by default to avoid performance overhead
+        self.federated_round = 0
+        self.global_model = None  # Global model (e.g., position estimation model)
+        self.robot_updates = []  # Store updates from each robot
+        self.federated_ga = None  # GA optimizer for federated learning
         
         # Initialize coverage grid
         grid_margin = 2.0  # Extra margin around boundary
@@ -228,7 +293,16 @@ class RobotWebGUI(QMainWindow):
         self.gpb_error_history = []
         self.gpb_convergence_history = []
         
-        # Initialize differential robots in a larger circle with better spacing
+        # Initialize robots: mix of differential (Roomba) and drone types for non-IID federated learning
+        # Different robot types have different observation models (non-IID data)
+        robot_types = []
+        for i in range(self.num_robots):
+            # Alternate between differential (Roomba) and drone types
+            if i % 2 == 0:
+                robot_types.append('differential')  # Roomba - ground view
+            else:
+                robot_types.append('drone')  # Drone - aerial view
+        
         for i in range(self.num_robots):
             angle = 2 * np.pi * i / self.num_robots
             # Initial position on circle - use larger radius for better spacing
@@ -236,7 +310,14 @@ class RobotWebGUI(QMainWindow):
             # Smaller noise for cleaner start
             initial_estimate = gt_pos + np.random.normal(0, 0.2, 2)
             
-            robot = RobotAgent(f"DiffRobot{i+1}", initial_estimate, robot_type='differential')
+            robot_type = robot_types[i]
+            if robot_type == 'differential':
+                robot = RobotAgent(f"Roomba{i+1}", initial_estimate, robot_type='differential')
+            else:  # drone
+                robot = RobotAgent(f"Drone{i+1}", initial_estimate, robot_type='differential')  # Use differential for now, will add drone kinematics
+                # Mark as drone type for federated learning
+                robot.robot_type = 'drone'
+                robot.observation_model = 'aerial'  # Different observation model
             robot.gt_pos = gt_pos.copy()  # Store ground truth (actual physical position)
             robot.gt_angle = angle  # Ground truth angle
             # Alternate direction: even robots clockwise, odd robots counter-clockwise
@@ -259,8 +340,28 @@ class RobotWebGUI(QMainWindow):
             self.robot_paths[robot.id] = [initial_estimate.copy()]
             self.robot_gt_paths[robot.id] = [gt_pos.copy()]
             
+            # Initialize SLAM observations for this robot
+            if robot.id not in self.slam_observations:
+                self.slam_observations[robot.id] = []
+            
             # Mark initial position in coverage grid
             self._update_coverage_grid(gt_pos, robot.radius)
+        
+        # Initialize federated learning GA optimizer (only if enabled)
+        # Note: Federated learning is disabled by default to avoid performance overhead
+        # Users can enable it via the UI checkbox if needed
+        if self.use_federated_learning:
+            robot_types_list = [r.robot_type for r in self.robots]
+            self.federated_ga = FederatedLearningGA(
+                population_size=20,
+                mutation_rate=0.15,
+                crossover_rate=0.7,
+                num_robot_types=len(set(robot_types_list)),
+                max_clients_per_round=None
+            )
+            self.federated_ga.initialize_population(len(self.robots), robot_types_list)
+        else:
+            self.federated_ga = None  # Ensure it's None when disabled
         
     
     def init_obstacles(self):
@@ -381,7 +482,8 @@ class RobotWebGUI(QMainWindow):
         dist = np.linalg.norm(robot_pos - closest)
         return dist < robot_radius
     
-    def init_maze(self):
+    # MAZE DISABLED - Commented out for federated learning
+    def init_maze_disabled(self):
         """Initialize maze walls for non-convex environment."""
         self.maze_walls = []
         if not self.use_maze:
@@ -444,6 +546,55 @@ class RobotWebGUI(QMainWindow):
         # Debug output
         if self.debug_console and len(self.maze_walls) > 0:
             print(f"[Maze] Initialized {len(self.maze_walls)} wall segments (complexity={self.maze_complexity})")
+    
+    def _collect_federated_updates(self):
+        """Collect updates from all robots for federated learning."""
+        self.robot_updates = []
+        for robot in self.robots:
+            if not robot.is_active:
+                continue
+            
+            # Simulate robot's local training update
+            # In real federated learning, this would be model weights/gradients
+            # For now, we use position estimation error as a proxy for model quality
+            position_error = np.linalg.norm(robot.mu - robot.gt_pos)
+            
+            # Different robot types have different observation models (non-IID)
+            if robot.robot_type == 'differential':  # Roomba - ground view
+                # Ground robots see obstacles and landmarks differently
+                observation_quality = 0.8  # Good for ground features
+                data_size = 100  # More data from ground exploration
+            elif robot.robot_type == 'drone':  # Drone - aerial view
+                # Aerial robots see topology differently
+                observation_quality = 0.6  # Different perspective
+                data_size = 50  # Less data, different distribution
+            else:
+                observation_quality = 0.7
+                data_size = 75
+            
+            # Create update (simplified: using position estimate as "model")
+            update = {
+                'weights': robot.mu.copy(),  # In real FL, this would be model parameters
+                'type': robot.robot_type,
+                'data_size': data_size,
+                'loss': position_error,  # Lower is better
+                'observation_quality': observation_quality
+            }
+            self.robot_updates.append(update)
+    
+    def _apply_global_update(self, global_update: np.ndarray, config: Dict):
+        """Apply aggregated global update to robots."""
+        # Simplified: adjust robot position estimates based on global consensus
+        # In real federated learning, this would update model parameters
+        selected_indices = np.where(config['client_selection'])[0]
+        
+        for idx in selected_indices:
+            if idx < len(self.robots):
+                robot = self.robots[idx]
+                if robot.is_active:
+                    # Blend global update with local estimate (weighted average)
+                    alpha = 0.1  # Learning rate
+                    robot.mu = (1 - alpha) * robot.mu + alpha * global_update
     
     def create_control_panel(self):
         """Create the left control panel with settings."""
@@ -613,7 +764,7 @@ class RobotWebGUI(QMainWindow):
         # Sub-group: GBP Parameters
         gbp_params_group = QGroupBox("GBP Parameters")
         gbp_params_group.setCheckable(True)
-        gbp_params_group.setChecked(False)  # Start collapsed to reduce clutter
+        gbp_params_group.setChecked(True)  # Enabled by default so controls are selectable
         gbp_params_group.setStyleSheet("""
             QGroupBox { 
                 font-weight: bold; 
@@ -695,7 +846,7 @@ class RobotWebGUI(QMainWindow):
         # Sub-group: Maze & GA Settings
         maze_ga_group = QGroupBox("Maze & GA Selection")
         maze_ga_group.setCheckable(True)
-        maze_ga_group.setChecked(False)  # Start collapsed
+        maze_ga_group.setChecked(True)  # Enabled by default so controls are selectable
         maze_ga_group.setStyleSheet("""
             QGroupBox { 
                 font-weight: bold; 
@@ -714,10 +865,17 @@ class RobotWebGUI(QMainWindow):
         maze_ga_layout = QVBoxLayout()
         maze_ga_layout.setSpacing(5)
         
-        self.use_maze_cb = QCheckBox("Enable Maze Environment")
-        self.use_maze_cb.setChecked(self.use_maze)
-        self.use_maze_cb.stateChanged.connect(self.on_maze_changed)
-        maze_ga_layout.addWidget(self.use_maze_cb)
+        # MAZE DISABLED - Commented out for federated learning
+        # self.use_maze_cb = QCheckBox("Enable Maze Environment")
+        # self.use_maze_cb.setChecked(self.use_maze)
+        # self.use_maze_cb.stateChanged.connect(self.on_maze_changed)
+        # maze_ga_layout.addWidget(self.use_maze_cb)
+        
+        # Federated Learning toggle
+        self.use_federated_cb = QCheckBox("Enable-FL(GA)")
+        self.use_federated_cb.setChecked(self.use_federated_learning)
+        self.use_federated_cb.stateChanged.connect(self.on_federated_changed)
+        maze_ga_layout.addWidget(self.use_federated_cb)
         
         maze_complexity_layout = QHBoxLayout()
         maze_complexity_layout.addWidget(QLabel("Maze Complexity:"))
@@ -803,6 +961,11 @@ class RobotWebGUI(QMainWindow):
         self.show_coverage_cb.setChecked(self.show_coverage_map)
         self.show_coverage_cb.stateChanged.connect(self.on_show_coverage_changed)
         viz_layout.addWidget(self.show_coverage_cb)
+        
+        self.show_slam_cb = QCheckBox("Show SLAM Factor Graph")
+        self.show_slam_cb.setChecked(self.show_slam_visualization)
+        self.show_slam_cb.stateChanged.connect(self.on_show_slam_changed)
+        viz_layout.addWidget(self.show_slam_cb)
         
         self.show_samples_cb = QCheckBox("Show Samples")
         self.show_samples_cb.setChecked(self.show_samples)
@@ -976,18 +1139,45 @@ class RobotWebGUI(QMainWindow):
     def on_dynamic_changed(self, state):
         self.allow_dynamic_join_leave = (state == Qt.CheckState.Checked)
     
-    def on_maze_changed(self, state):
-        # Fix: stateChanged signal passes an integer (0=Unchecked, 2=Checked)
-        # Use explicit integer comparison for reliability
-        checked_value = 2  # Qt.CheckState.Checked
-        self.use_maze = (int(state) == checked_value)
-        self.init_maze()
-        # Force immediate update to show walls
-        if self.debug_console:
-            if self.use_maze:
-                print(f"[Maze] Enabled: {len(self.maze_walls)} walls created")
-            else:
-                print(f"[Maze] Disabled")
+    # MAZE DISABLED
+    # def on_maze_changed(self, state):
+    #     # Fix: stateChanged signal passes an integer (0=Unchecked, 2=Checked)
+    #     # Use explicit integer comparison for reliability
+    #     checked_value = 2  # Qt.CheckState.Checked
+    #     self.use_maze = (int(state) == checked_value)
+    #     self.init_maze()
+    #     # Force immediate update to show walls
+    #     if self.debug_console:
+    #         if self.use_maze:
+    #             print(f"[Maze] Enabled: {len(self.maze_walls)} walls created")
+    #         else:
+    #             print(f"[Maze] Disabled")
+    
+    def on_federated_changed(self, state):
+        self.use_federated_learning = (int(state) == 2)
+        if self.use_federated_learning and self.federated_ga is None:
+            # Initialize federated learning GA optimizer when enabled
+            robot_types_list = [r.robot_type for r in self.robots]
+            self.federated_ga = FederatedLearningGA(
+                population_size=20,
+                mutation_rate=0.15,
+                crossover_rate=0.7,
+                num_robot_types=len(set(robot_types_list)),
+                max_clients_per_round=None
+            )
+            self.federated_ga.initialize_population(len(self.robots), robot_types_list)
+            if self.debug_console:
+                print(f"[Federated Learning] Enabled and initialized")
+        elif not self.use_federated_learning:
+            # Clean up when disabled
+            self.federated_ga = None
+            self.federated_round = 0
+            self.federated_fitness_history = []
+            self.federated_aggregation_weights_history = []
+            self.federated_client_selection_history = []
+            self.federated_metrics_history = []
+            if self.debug_console:
+                print(f"[Federated Learning] Disabled and cleaned up")
     
     def on_maze_complexity_changed(self, value):
         self.maze_complexity = value
@@ -1016,6 +1206,9 @@ class RobotWebGUI(QMainWindow):
     
     def on_show_coverage_changed(self, state):
         self.show_coverage_map = (int(state) == 2)
+    
+    def on_show_slam_changed(self, state):
+        self.show_slam_visualization = (int(state) == 2)
     
     def on_show_samples_changed(self, state):
         self.show_samples = (state == Qt.CheckState.Checked)
@@ -1158,9 +1351,10 @@ class RobotWebGUI(QMainWindow):
                         'robot_radius': robot.radius
                     })
                 
+                # MAZE DISABLED - Commented out
                 # Add maze walls as static obstacles (only if RVO is enabled)
                 # When RVO is disabled, walls are still handled by collision detection below
-                if self.use_rvo and self.use_maze and self.maze_walls:
+                if False and self.use_rvo and self.use_maze and self.maze_walls:  # MAZE DISABLED
                     for wall_start, wall_end in self.maze_walls:
                         # Find closest point on wall segment to robot (use ground truth for actual avoidance)
                         closest_point = self._closest_point_on_segment(robot.gt_pos, wall_start, wall_end)
@@ -1289,8 +1483,9 @@ class RobotWebGUI(QMainWindow):
             old_gt_pos = old_data['pos']
             old_gt_angle = old_data['angle']
             
+            # MAZE DISABLED - Commented out
             # Check for wall collisions on GROUND TRUTH position
-            if self.use_maze and self.maze_walls:
+            if False and self.use_maze and self.maze_walls:  # MAZE DISABLED
                 # Check if new ground truth position collides with any wall
                 collision_detected = False
                 for wall_start, wall_end in self.maze_walls:
@@ -1348,6 +1543,93 @@ class RobotWebGUI(QMainWindow):
             # Update coverage map based on ground truth position
             self._update_coverage_grid(robot.gt_pos, robot.radius)
         
+        # Federated Learning: Collect updates from robots (non-IID data)
+        # Only run if enabled and GA optimizer is initialized
+        if self.use_federated_learning:
+            # Ensure federated_ga is initialized
+            if self.federated_ga is None:
+                robot_types_list = [r.robot_type for r in self.robots]
+                self.federated_ga = FederatedLearningGA(
+                    population_size=20,
+                    mutation_rate=0.15,
+                    crossover_rate=0.7,
+                    num_robot_types=len(set(robot_types_list)),
+                    max_clients_per_round=None
+                )
+                self.federated_ga.initialize_population(len(self.robots), robot_types_list)
+                if self.debug_console:
+                    print(f"[Federated Learning] Auto-initialized GA optimizer")
+            
+            # Run federated learning every 50 iterations
+            if self.iter_count % 50 == 0:
+                self._collect_federated_updates()
+                if len(self.robot_updates) > 0:
+                    # Use GA to optimize aggregation
+                    robot_types_list = [r.robot_type for r in self.robots]
+                    best_config, fitness_history = self.federated_ga.evolve(
+                        self.robot_updates, robot_types_list, generations=5, track_history=True
+                    )
+                    
+                    # Store federated learning metrics for visualization
+                    if fitness_history:
+                        self.federated_fitness_history.append({
+                            'round': self.federated_round,
+                            'best': fitness_history[-1]['best'],
+                            'avg': fitness_history[-1]['avg']
+                        })
+                    
+                    # Store aggregation weights
+                    type_names = list(self.federated_ga.type_to_index.keys())
+                    weights_dict = {}
+                    for type_name, idx in self.federated_ga.type_to_index.items():
+                        weights_dict[type_name] = best_config['aggregation_weights'][idx]
+                    self.federated_aggregation_weights_history.append({
+                        'round': self.federated_round,
+                        'weights': weights_dict
+                    })
+                    
+                    # Store client selection
+                    selected_clients = np.where(best_config['client_selection'])[0].tolist()
+                    self.federated_client_selection_history.append({
+                        'round': self.federated_round,
+                        'selected': selected_clients
+                    })
+                    
+                    # Calculate and store metrics
+                    diversity = self.federated_ga._compute_diversity_score(
+                        [robot_types_list[i] for i in selected_clients]
+                    )
+                    fairness = self.federated_ga._compute_fairness_score(
+                        best_config,
+                        [self.robot_updates[i] for i in selected_clients],
+                        [robot_types_list[i] for i in selected_clients]
+                    )
+                    quality = self.federated_ga._compute_update_quality(
+                        [self.robot_updates[i] for i in selected_clients]
+                    )
+                    self.federated_metrics_history.append({
+                        'round': self.federated_round,
+                        'diversity': diversity,
+                        'fairness': fairness,
+                        'quality': quality
+                    })
+                    
+                    # Aggregate updates using optimized configuration
+                    global_update = self.federated_ga.aggregate_updates(
+                        best_config, self.robot_updates, robot_types_list
+                    )
+                    if global_update is not None:
+                        # Apply global update to robots (simplified: update position estimates)
+                        self._apply_global_update(global_update, best_config)
+                    
+                    if self.debug_console:
+                        print(f"[Federated Learning] Round {self.federated_round}: "
+                              f"Fitness={fitness_history[-1]['best']:.3f}, "
+                              f"Diversity={diversity:.3f}, Fairness={fairness:.3f}, "
+                              f"Selected {len(selected_clients)}/{len(self.robots)} clients")
+                    
+                    self.federated_round += 1
+        
         # Perform GBP iterations (GPB for robot-to-robot observations)
         if self.iter_count % self.iter_before_motion == 0:
             # Reset message counter for this iteration
@@ -1389,7 +1671,7 @@ class RobotWebGUI(QMainWindow):
                                 robot.mu,
                                 self.landmarks[:self.num_landmarks],
                                 self.sensor_range,
-                                self.maze_walls if self.use_maze else None,
+                                None,  # self.maze_walls if self.use_maze else None,  # MAZE DISABLED
                                 max_selected=self.ga_max_selected,
                                 ga_generations=self.ga_generations,
                                 track_history=True
@@ -1433,6 +1715,18 @@ class RobotWebGUI(QMainWindow):
                             robot.inbox[f'landmark_{lm_idx}'] = message
                             messages_received += 1
                             message_details.append(f"  {robot.name}: received from landmark {lm_idx+1} (dist={dist_gt:.2f})")
+                            
+                            # Track SLAM observation for factor graph visualization
+                            if self.show_slam_visualization:
+                                if robot.id not in self.slam_observations:
+                                    self.slam_observations[robot.id] = []
+                                # Store observation: (pose, landmark_idx, iteration)
+                                self.slam_observations[robot.id].append((
+                                    robot.gt_pos.copy(), lm_idx, self.iter_count
+                                ))
+                                # Limit history to prevent memory issues
+                                if len(self.slam_observations[robot.id]) > 500:
+                                    self.slam_observations[robot.id].pop(0)
                 else:
                     # Include landmark messages even when not in landmark-only mode
                     for lm_idx, landmark_pos in enumerate(self.landmarks[:self.num_landmarks]):
@@ -1849,6 +2143,7 @@ class RobotWebGUI(QMainWindow):
             needs_recreate = True
         elif not self.use_ga_landmark_selection and self.ax_ga is not None:
             needs_recreate = True
+        # Federated learning plot is in separate tab, no need to recreate main figure
         
         if needs_recreate:
             old_fig = self.fig
@@ -2094,7 +2389,31 @@ class RobotWebGUI(QMainWindow):
         
         # Maze walls already drawn above (right after clear)
         
-        # Draw landmarks (black squares, distinct from robot ground truth stars)
+        # SLAM Visualization: Draw factor graph (observation connections)
+        if self.show_slam_visualization:
+            # Draw grey lines from historical robot poses to landmarks (factor graph edges)
+            for robot_id, observations in self.slam_observations.items():
+                for pose, landmark_idx, obs_iter in observations:
+                    if landmark_idx < len(self.landmarks):
+                        landmark_pos = self.landmarks[landmark_idx]
+                        # Draw grey line (factor graph edge) - use alpha based on recency
+                        # More recent observations are more opaque
+                        age = self.iter_count - obs_iter
+                        alpha = max(0.1, 1.0 - age / 200.0)  # Fade out old observations
+                        self.ax.plot([pose[0], landmark_pos[0]], [pose[1], landmark_pos[1]],
+                                   'grey', linewidth=0.5, alpha=alpha, zorder=1)
+            
+            # Draw ground truth pose history as yellow dots
+            for robot in self.robots:
+                if robot.id in self.robot_gt_paths and len(self.robot_gt_paths[robot.id]) > 0:
+                    path = np.array(self.robot_gt_paths[robot.id])
+                    # Show last 200 poses as yellow dots
+                    if len(path) > 200:
+                        path = path[-200:]
+                    self.ax.plot(path[:, 0], path[:, 1], 'yo', markersize=2, alpha=0.6, zorder=2,
+                               label='GT Poses' if robot is self.robots[0] else '')
+        
+        # Draw landmarks (white dots for SLAM visualization, or black squares if SLAM disabled)
         # First, draw connections from robots to their GA-selected landmarks
         # Draw from GROUND TRUTH positions (where robots actually are)
         if self.use_ga_landmark_selection:
@@ -2123,69 +2442,115 @@ class RobotWebGUI(QMainWindow):
                             selected_by_robots.append(robot)
                             break
             
-            # Use different color for GA-selected landmarks
-            if is_ga_selected:
-                marker_color = 'gold'
-                marker_edge = 'orange'
-                marker_size = 15  # Larger for GA-selected
+            # For SLAM visualization: use white dots for landmarks (ground truth positions)
+            # Otherwise use colored squares
+            if self.show_slam_visualization:
+                # White dots for landmarks (ground truth positions)
+                marker_color = 'white'
+                marker_edge = 'black'
+                marker_size = 8
+                marker_style = 'o'  # Circle
             else:
-                marker_color = 'black'
-                marker_edge = 'white'
-                marker_size = 12
+                # Use different color for GA-selected landmarks (original style)
+                if is_ga_selected:
+                    marker_color = 'gold'
+                    marker_edge = 'orange'
+                    marker_size = 15  # Larger for GA-selected
+                else:
+                    marker_color = 'black'
+                    marker_edge = 'white'
+                    marker_size = 12
+                marker_style = 's'  # Square
             
             label = "Landmark" if lm_idx == 0 else None
-            self.ax.plot(landmark_pos[0], landmark_pos[1], 's', 
-                        markersize=marker_size, markeredgewidth=3 if is_ga_selected else 2, 
+            self.ax.plot(landmark_pos[0], landmark_pos[1], marker_style, 
+                        markersize=marker_size, markeredgewidth=2, 
                         markerfacecolor=marker_color, markeredgecolor=marker_edge,
                         label=label, zorder=10)
             # Add landmark number with GA indicator
             label_text = f'L{lm_idx+1}'
-            if is_ga_selected:
+            if is_ga_selected and not self.show_slam_visualization:
                 label_text += ' (GA)'
+            text_color = 'black' if self.show_slam_visualization else ('darkorange' if is_ga_selected else 'black')
             self.ax.text(landmark_pos[0] + 0.5, landmark_pos[1] + 0.5, 
                         label_text, fontsize=8, fontweight='bold' if is_ga_selected else 'normal',
-                        color='darkorange' if is_ga_selected else 'black',
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow' if is_ga_selected else 'white', 
-                                alpha=0.8, edgecolor='orange' if is_ga_selected else 'gray'),
+                        color=text_color,
+                        bbox=dict(boxstyle='round,pad=0.3', 
+                                facecolor='white' if self.show_slam_visualization else ('yellow' if is_ga_selected else 'white'), 
+                                alpha=0.8, edgecolor='gray'),
                         zorder=11)
         
         # Draw obstacles
         for obs_pos in self.obstacles:
             obstacle_circle = MplCircle(obs_pos, self.obstacle_radius, 
-                                      fill=True, color='red', alpha=0.5, 
+                                      fill=True, facecolor='red', alpha=0.5, 
                                       edgecolor='darkred', linewidth=2,
                                       label='Obstacle' if obs_pos is self.obstacles[0] else None,
                                       zorder=3)
             self.ax.add_patch(obstacle_circle)
         
-        # Draw robots (differential drive - Roomba-like)
+        # Draw robots (differential drive - Roomba-like, and Drones)
         # Draw at GROUND TRUTH position (where robot actually is)
         colors = plt.cm.tab10(np.linspace(0, 1, len(self.robots)))
         for i, robot in enumerate(self.robots):
-            # Differential robots: circles with orientation arrows
-            # Draw at ground truth position (actual physical location)
-            self.ax.plot(robot.gt_pos[0], robot.gt_pos[1], 'o', color=colors[i], 
-                        markersize=10, markeredgecolor='black', markeredgewidth=1.5,
-                        label=f"Robot {i+1}", zorder=5)
+            # Determine robot type for visualization
+            is_drone = (robot.robot_type == 'drone' or 'Drone' in robot.name)
+            
+            if is_drone:
+                # Drones: triangles (upward-pointing) to distinguish from ground robots
+                marker = '^'  # Triangle marker
+                marker_size = 12
+                edge_color = 'darkblue'
+                edge_width = 2
+                robot_label = f"Drone {i+1}" if i == 0 or robot is self.robots[0] else None
+            else:
+                # Roomba/Differential: circles
+                marker = 'o'  # Circle marker
+                marker_size = 10
+                edge_color = 'black'
+                edge_width = 1.5
+                robot_label = f"Roomba {i+1}" if i == 0 or robot is self.robots[0] else None
+            
+            # Draw robot at ground truth position (actual physical location)
+            self.ax.plot(robot.gt_pos[0], robot.gt_pos[1], marker, color=colors[i], 
+                        markersize=marker_size, markeredgecolor=edge_color, markeredgewidth=edge_width,
+                        label=robot_label, zorder=5)
+            
             # Draw orientation arrow based on ground truth angle
             arrow_length = 0.8
             dx = arrow_length * np.cos(robot.gt_angle)
             dy = arrow_length * np.sin(robot.gt_angle)
+            # Use different arrow style for drones
+            arrow_style = '->' if is_drone else '->'
+            arrow_color = 'darkblue' if is_drone else colors[i]
             self.ax.arrow(robot.gt_pos[0], robot.gt_pos[1], dx, dy,
-                        head_width=0.3, head_length=0.2, fc=colors[i], ec='black', zorder=6)
+                        head_width=0.3, head_length=0.2, fc=arrow_color, ec=edge_color, 
+                        zorder=6, linestyle='-' if is_drone else '-')
             
-            # Optionally draw estimated position as a smaller circle to show localization error
+            # Optionally draw estimated position to show localization error
             if self.show_factors:
-                # Draw estimated position (mu) as a smaller, semi-transparent circle
-                self.ax.plot(robot.mu[0], robot.mu[1], 'o', color=colors[i], 
-                            markersize=6, alpha=0.5, zorder=4)
+                # Draw estimated position (mu) - use same marker type as robot
+                est_marker = '^' if is_drone else 'o'
+                est_size = 6 if is_drone else 6
+                self.ax.plot(robot.mu[0], robot.mu[1], est_marker, color=colors[i], 
+                            markersize=est_size, alpha=0.5, zorder=4)
                 # Draw line from estimated to ground truth to show error
                 self.ax.plot([robot.mu[0], robot.gt_pos[0]], [robot.mu[1], robot.gt_pos[1]], 
                             '--', color=colors[i], linewidth=1, alpha=0.3, zorder=3)
         
         self.ax.set_aspect('equal')
         self.ax.grid(True, alpha=0.3)
-        title = "Differential Drive Robots"
+        
+        # Update title to reflect robot types
+        has_drones = any(r.robot_type == 'drone' or 'Drone' in r.name for r in self.robots)
+        has_roomba = any(r.robot_type == 'differential' or 'Roomba' in r.name for r in self.robots)
+        if has_drones and has_roomba:
+            title = "Multi-Robot System (Roomba + Drones)"
+        elif has_drones:
+            title = "Drone Swarm"
+        else:
+            title = "Differential Drive Robots (Roomba)"
+        
         if self.use_rvo:
             title += " with RVO"
         title += " & GPB"
@@ -2332,6 +2697,9 @@ class RobotWebGUI(QMainWindow):
                 self.ax_ga.set_title("GA Evolution: Fitness Over Generations", fontsize=10, fontweight='bold')
                 self.ax_ga.grid(True, alpha=0.3)
         
+        # Update Federated Learning plot in separate tab
+        self._update_federated_plot()
+        
         # Add author footer to GPB plot as well
         footer_text_gpb = "For educational purposes | Author: Thiwanka Jayasiri | Ref: arXiv:2202.03314"
         self.ax_gpb.text(0.99, 0.01, footer_text_gpb, 
@@ -2404,6 +2772,245 @@ class RobotWebGUI(QMainWindow):
         if self.async_communication:
             robots_text += f"\nPacket Loss: {self.communication_drop_rate*100:.1f}%"
         self.robots_status_label.setText(robots_text)
+    
+    def _update_federated_plot(self):
+        """Update the federated learning plot in the separate tab with sleek, professional plots."""
+        # Always update the plot (even if disabled, to show status)
+        if not hasattr(self, 'ax_fl_fitness') or self.ax_fl_fitness is None:
+            return
+        
+        if not self.use_federated_learning:
+            if hasattr(self, 'fl_status_label'):
+                self.fl_status_label.setText("Federated Learning: Disabled")
+            # Clear all subplots and show disabled message
+            self.ax_fl_fitness.clear()
+            self.ax_fl_weights.clear()
+            self.ax_fl_metrics.clear()
+            self.ax_fl_clients.clear()
+            
+            # Show message in first subplot
+            self.ax_fl_fitness.text(0.5, 0.5, 'Federated Learning is Disabled\n\n'
+                                         'Enable "Enable-FL(GA)" in settings to start.',
+                                     transform=self.ax_fl_fitness.transAxes,
+                                     ha='center', va='center', fontsize=12, style='italic',
+                                     bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+            self.ax_fl_fitness.set_title("Federated Learning (GA-Optimized)", 
+                                        fontsize=14, fontweight='bold', pad=15)
+            self.canvas_fl.draw()
+            return
+        
+        # Clear all subplots
+        self.ax_fl_fitness.clear()
+        self.ax_fl_weights.clear()
+        self.ax_fl_metrics.clear()
+        self.ax_fl_clients.clear()
+        
+        # Update status to show it's enabled
+        if hasattr(self, 'fl_status_label'):
+            if len(self.federated_fitness_history) == 0:
+                next_round_iter = ((self.iter_count // 50) + 1) * 50
+                self.fl_status_label.setText(
+                    f"Enabled | Next round at iteration {next_round_iter} (current: {self.iter_count})"
+                )
+            else:
+                latest_round = self.federated_fitness_history[-1]['round']
+                latest_fitness = self.federated_fitness_history[-1]['best']
+                if len(self.federated_client_selection_history) > 0:
+                    latest_selection = self.federated_client_selection_history[-1]
+                    selected_count = len(latest_selection['selected'])
+                    self.fl_status_label.setText(
+                        f"Round {latest_round} | Fitness: {latest_fitness:.4f} | "
+                        f"Selected: {selected_count}/{len(self.robots)} clients"
+                    )
+                else:
+                    self.fl_status_label.setText(
+                        f"Round {latest_round} | Fitness: {latest_fitness:.4f}"
+                    )
+        
+        if len(self.federated_fitness_history) > 0:
+            rounds = [h['round'] for h in self.federated_fitness_history]
+            best_fitness = [h['best'] for h in self.federated_fitness_history]
+            avg_fitness = [h['avg'] for h in self.federated_fitness_history]
+            
+            # ===== SUBPLOT 1: GA Fitness Evolution =====
+            self.ax_fl_fitness.plot(rounds, best_fitness, 'o-', color='#2E86AB', linewidth=2.5, 
+                                   markersize=6, label='Best Fitness', alpha=0.9, zorder=3)
+            self.ax_fl_fitness.plot(rounds, avg_fitness, 's--', color='#A23B72', linewidth=2, 
+                                   markersize=5, label='Avg Fitness', alpha=0.8, zorder=2)
+            self.ax_fl_fitness.set_xlabel("Federated Round", fontsize=11, fontweight='bold')
+            self.ax_fl_fitness.set_ylabel("Fitness Score", fontsize=11, fontweight='bold')
+            self.ax_fl_fitness.set_title("GA Fitness Evolution", fontsize=12, fontweight='bold', pad=10)
+            self.ax_fl_fitness.grid(True, alpha=0.3, linestyle='--', linewidth=0.8)
+            self.ax_fl_fitness.legend(loc='best', fontsize=9, framealpha=0.95, fancybox=True, shadow=True)
+            self.ax_fl_fitness.set_facecolor('#FAFAFA')
+            
+            # ===== SUBPLOT 2: Aggregation Weights Over Time =====
+            if len(self.federated_aggregation_weights_history) > 0:
+                # Get all unique robot types
+                all_types = set()
+                for w_dict in self.federated_aggregation_weights_history:
+                    all_types.update(w_dict['weights'].keys())
+                all_types = sorted(list(all_types))
+                
+                # Plot weight evolution for each type
+                colors_weights = plt.cm.Set2(np.linspace(0, 1, len(all_types)))
+                for i, robot_type in enumerate(all_types):
+                    weight_history = []
+                    weight_rounds = []
+                    for w_entry in self.federated_aggregation_weights_history:
+                        if robot_type in w_entry['weights']:
+                            weight_history.append(w_entry['weights'][robot_type])
+                            weight_rounds.append(w_entry['round'])
+                    
+                    if len(weight_history) > 0:
+                        type_label = robot_type.replace('differential', 'Roomba').replace('drone', 'Drone').title()
+                        self.ax_fl_weights.plot(weight_rounds, weight_history, 'o-', 
+                                               color=colors_weights[i], linewidth=2.5, 
+                                               markersize=6, label=type_label, alpha=0.9)
+                
+                self.ax_fl_weights.set_xlabel("Federated Round", fontsize=11, fontweight='bold')
+                self.ax_fl_weights.set_ylabel("Aggregation Weight", fontsize=11, fontweight='bold')
+                self.ax_fl_weights.set_title("Aggregation Weights (Translation Layer)", 
+                                            fontsize=12, fontweight='bold', pad=10)
+                self.ax_fl_weights.set_ylim(0, 1.0)
+                self.ax_fl_weights.grid(True, alpha=0.3, linestyle='--', linewidth=0.8)
+                self.ax_fl_weights.legend(loc='best', fontsize=9, framealpha=0.95, fancybox=True, shadow=True)
+                self.ax_fl_weights.set_facecolor('#FAFAFA')
+            else:
+                self.ax_fl_weights.text(0.5, 0.5, 'No weight data yet', 
+                                       transform=self.ax_fl_weights.transAxes,
+                                       ha='center', va='center', fontsize=11, style='italic')
+                self.ax_fl_weights.set_title("Aggregation Weights", fontsize=12, fontweight='bold')
+            
+            # ===== SUBPLOT 3: Metrics (Diversity, Fairness, Quality) =====
+            if len(self.federated_metrics_history) > 0:
+                metric_rounds = [m['round'] for m in self.federated_metrics_history]
+                diversity = [m['diversity'] for m in self.federated_metrics_history]
+                fairness = [m['fairness'] for m in self.federated_metrics_history]
+                quality = [m['quality'] for m in self.federated_metrics_history]
+                
+                self.ax_fl_metrics.plot(metric_rounds, diversity, 'o-', color='#06A77D', 
+                                       linewidth=2.5, markersize=6, label='Diversity', alpha=0.9)
+                self.ax_fl_metrics.plot(metric_rounds, fairness, 's-', color='#F18F01', 
+                                       linewidth=2.5, markersize=6, label='Fairness', alpha=0.9)
+                self.ax_fl_metrics.plot(metric_rounds, quality, '^-', color='#C73E1D', 
+                                       linewidth=2.5, markersize=6, label='Quality', alpha=0.9)
+                
+                self.ax_fl_metrics.set_xlabel("Federated Round", fontsize=11, fontweight='bold')
+                self.ax_fl_metrics.set_ylabel("Metric Value", fontsize=11, fontweight='bold')
+                self.ax_fl_metrics.set_title("Non-IID Handling Metrics", fontsize=12, fontweight='bold', pad=10)
+                self.ax_fl_metrics.set_ylim(0, 1.05)
+                self.ax_fl_metrics.grid(True, alpha=0.3, linestyle='--', linewidth=0.8)
+                self.ax_fl_metrics.legend(loc='best', fontsize=9, framealpha=0.95, fancybox=True, shadow=True)
+                self.ax_fl_metrics.set_facecolor('#FAFAFA')
+            else:
+                self.ax_fl_metrics.text(0.5, 0.5, 'No metrics data yet', 
+                                       transform=self.ax_fl_metrics.transAxes,
+                                       ha='center', va='center', fontsize=11, style='italic')
+                self.ax_fl_metrics.set_title("Non-IID Handling Metrics", fontsize=12, fontweight='bold')
+            
+            # ===== SUBPLOT 4: Client Selection Over Rounds =====
+            if len(self.federated_client_selection_history) > 0:
+                # Better visualization: Show selection count and individual robot selection status
+                rounds = [s['round'] for s in self.federated_client_selection_history]
+                num_selected = [len(s['selected']) for s in self.federated_client_selection_history]
+                num_robots = len(self.robots)
+                
+                # Create two y-axes: one for count, one for individual robot status
+                ax_count = self.ax_fl_clients
+                
+                # Plot 1: Number of selected clients as bars
+                colors_bar = ['#06A77D' if n > num_robots/2 else '#F18F01' for n in num_selected]
+                bars = ax_count.bar(rounds, num_selected, alpha=0.6, color=colors_bar, 
+                                   edgecolor='black', linewidth=1.5, label='Selected Clients', zorder=2)
+                ax_count.set_xlabel("Federated Round", fontsize=11, fontweight='bold')
+                ax_count.set_ylabel("Number of Selected Clients", fontsize=11, fontweight='bold', color='#06A77D')
+                ax_count.set_ylim(0, num_robots + 0.5)
+                ax_count.set_yticks(range(num_robots + 1))
+                ax_count.tick_params(axis='y', labelcolor='#06A77D')
+                ax_count.grid(True, alpha=0.3, linestyle='--', linewidth=0.8, axis='y')
+                
+                # Add value labels on bars
+                for bar, count in zip(bars, num_selected):
+                    height = bar.get_height()
+                    ax_count.text(bar.get_x() + bar.get_width()/2., height,
+                                f'{int(count)}/{num_robots}',
+                                ha='center', va='bottom', fontsize=9, fontweight='bold')
+                
+                # Plot 2: Individual robot selection status as lines (secondary axis)
+                ax_robots = ax_count.twinx()
+                robot_colors = plt.cm.tab10(np.linspace(0, 1, num_robots))
+                
+                # For each robot, show selection status (1 = selected, 0 = not selected)
+                for robot_idx in range(num_robots):
+                    robot_selection = []
+                    for sel_entry in self.federated_client_selection_history:
+                        robot_selection.append(1.0 if robot_idx in sel_entry['selected'] else 0.0)
+                    
+                    # Get robot name and type for label
+                    robot = self.robots[robot_idx] if robot_idx < len(self.robots) else None
+                    robot_name = robot.name if robot else f'R{robot_idx+1}'
+                    is_drone = robot and (robot.robot_type == 'drone' or 'Drone' in robot.name)
+                    label = f"{robot_name} {'(Drone)' if is_drone else '(Roomba)'}"
+                    
+                    # Plot as step function for clarity
+                    ax_robots.plot(rounds, robot_selection, 'o-', color=robot_colors[robot_idx],
+                                 linewidth=2, markersize=5, label=label, alpha=0.7, zorder=1)
+                
+                ax_robots.set_ylabel("Selection Status", fontsize=11, fontweight='bold', color='#2E86AB')
+                ax_robots.set_ylim(-0.1, 1.1)
+                ax_robots.set_yticks([0, 1])
+                ax_robots.set_yticklabels(['Not Selected', 'Selected'], fontsize=9)
+                ax_robots.tick_params(axis='y', labelcolor='#2E86AB')
+                
+                self.ax_fl_clients.set_title("Client Selection Over Rounds", fontsize=12, fontweight='bold', pad=10)
+                self.ax_fl_clients.set_facecolor('#FAFAFA')
+                
+                # Add legend for robot selection lines (compact)
+                lines_robots, labels_robots = ax_robots.get_legend_handles_labels()
+                if len(lines_robots) <= 6:  # Only show legend if not too many robots
+                    ax_robots.legend(lines_robots, labels_robots, loc='upper right', 
+                                    fontsize=7, framealpha=0.9, ncol=1)
+            else:
+                self.ax_fl_clients.text(0.5, 0.5, 'No client selection data yet', 
+                                       transform=self.ax_fl_clients.transAxes,
+                                       ha='center', va='center', fontsize=11, style='italic')
+                self.ax_fl_clients.set_title("Client Selection Over Rounds", fontsize=12, fontweight='bold')
+        else:
+            # No data yet - show message in first subplot
+            self.ax_fl_fitness.text(0.5, 0.5, 'Waiting for federated learning data...\n\n'
+                                         f'Federated Learning is enabled.\n'
+                                         f'Next round will run at iteration {((self.iter_count // 50) + 1) * 50}\n'
+                                         f'(Current: {self.iter_count}, runs every 50 iterations)\n\n'
+                                         f'The system will collect updates from robots\n'
+                                         f'and use GA to optimize aggregation.',
+                                     transform=self.ax_fl_fitness.transAxes,
+                                     ha='center', va='center', fontsize=11, style='italic',
+                                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            self.ax_fl_fitness.set_title("Federated Learning (GA-Optimized)", 
+                                        fontsize=14, fontweight='bold', pad=15)
+            self.ax_fl_fitness.set_xlim(0, 10)
+            self.ax_fl_fitness.set_ylim(0, 1)
+            
+            # Show empty plots with labels
+            self.ax_fl_weights.set_title("Aggregation Weights", fontsize=12, fontweight='bold')
+            self.ax_fl_weights.text(0.5, 0.5, 'Waiting for data...', 
+                                   transform=self.ax_fl_weights.transAxes,
+                                   ha='center', va='center', fontsize=10, style='italic')
+            
+            self.ax_fl_metrics.set_title("Non-IID Handling Metrics", fontsize=12, fontweight='bold')
+            self.ax_fl_metrics.text(0.5, 0.5, 'Waiting for data...', 
+                                   transform=self.ax_fl_metrics.transAxes,
+                                   ha='center', va='center', fontsize=10, style='italic')
+            
+            self.ax_fl_clients.set_title("Client Selection Over Rounds", fontsize=12, fontweight='bold')
+            self.ax_fl_clients.text(0.5, 0.5, 'Waiting for data...', 
+                                   transform=self.ax_fl_clients.transAxes,
+                                   ha='center', va='center', fontsize=10, style='italic')
+        
+        # Always update the federated learning canvas
+        if hasattr(self, 'canvas_fl'):
+            self.canvas_fl.draw()
 
     def closeEvent(self, event):
         """Handle window close event - safely stop simulation."""
