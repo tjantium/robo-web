@@ -319,6 +319,10 @@ class RobotWebGUI(QMainWindow):
                 robot.robot_type = 'drone'
                 robot.observation_model = 'aerial'  # Different observation model
             robot.gt_pos = gt_pos.copy()  # Store ground truth (actual physical position)
+            # Initialize precision matrix (inverse covariance) with low precision (high uncertainty)
+            # This will be updated by GBP as observations come in
+            if not hasattr(robot, 'Lambda') or robot.Lambda is None:
+                robot.Lambda = np.eye(2) * 0.1  # Low precision = high initial uncertainty
             robot.gt_angle = angle  # Ground truth angle
             # Alternate direction: even robots clockwise, odd robots counter-clockwise
             robot.direction = 1 if i % 2 == 0 else -1  # 1 for clockwise, -1 for counter-clockwise
@@ -408,6 +412,44 @@ class RobotWebGUI(QMainWindow):
                 vel = np.array([0.0, 0.0])
             
             self.obstacle_velocities.append(vel)
+    
+    def _mahalanobis_distance(self, mu, gt_pos, Lambda):
+        """
+        Compute Mahalanobis distance between estimated position (mu) and ground truth (gt_pos).
+        
+        Mahalanobis distance: d_M = sqrt((x - μ)^T Σ^(-1) (x - μ))
+        Where Σ^(-1) = Lambda (precision matrix)
+        
+        This accounts for uncertainty - errors in directions with high uncertainty are less penalized.
+        More statistically meaningful than Euclidean distance for probabilistic localization.
+        
+        Args:
+            mu: Estimated position [x, y]
+            gt_pos: Ground truth position [x, y]
+            Lambda: Precision matrix (2x2) - inverse of covariance matrix
+        
+        Returns:
+            Mahalanobis distance (scalar)
+        """
+        diff = gt_pos - mu
+        
+        # Handle case where Lambda might be singular or not properly initialized
+        try:
+            # Mahalanobis distance: sqrt(diff^T * Lambda * diff)
+            mahal_dist_sq = diff.T @ Lambda @ diff
+            
+            # Ensure non-negative (numerical stability)
+            mahal_dist_sq = max(0.0, mahal_dist_sq)
+            mahal_dist = np.sqrt(mahal_dist_sq)
+            
+            # Fallback to Euclidean if precision matrix is invalid
+            if not np.isfinite(mahal_dist) or mahal_dist < 0:
+                return np.linalg.norm(diff)
+            
+            return mahal_dist
+        except (np.linalg.LinAlgError, ValueError):
+            # Fallback to Euclidean distance if precision matrix is invalid
+            return np.linalg.norm(diff)
     
     def _closest_point_on_segment(self, point, seg_start, seg_end):
         """
@@ -550,21 +592,26 @@ class RobotWebGUI(QMainWindow):
     def _collect_federated_updates(self):
         """Collect updates from all robots for federated learning."""
         self.robot_updates = []
+        active_count = 0
         for robot in self.robots:
             if not robot.is_active:
                 continue
             
+            active_count += 1
+            
             # Simulate robot's local training update
             # In real federated learning, this would be model weights/gradients
-            # For now, we use position estimation error as a proxy for model quality
-            position_error = np.linalg.norm(robot.mu - robot.gt_pos)
+            # Use Mahalanobis distance for position error (accounts for uncertainty)
+            position_error = self._mahalanobis_distance(robot.mu, robot.gt_pos, robot.Lambda)
             
             # Different robot types have different observation models (non-IID)
-            if robot.robot_type == 'differential':  # Roomba - ground view
+            # Check robot type (handle both 'differential' and 'drone' types)
+            robot_type_str = getattr(robot, 'robot_type', 'differential')
+            if robot_type_str == 'differential' or 'Roomba' in robot.name:  # Roomba - ground view
                 # Ground robots see obstacles and landmarks differently
                 observation_quality = 0.8  # Good for ground features
                 data_size = 100  # More data from ground exploration
-            elif robot.robot_type == 'drone':  # Drone - aerial view
+            elif robot_type_str == 'drone' or 'Drone' in robot.name:  # Drone - aerial view
                 # Aerial robots see topology differently
                 observation_quality = 0.6  # Different perspective
                 data_size = 50  # Less data, different distribution
@@ -573,14 +620,18 @@ class RobotWebGUI(QMainWindow):
                 data_size = 75
             
             # Create update (simplified: using position estimate as "model")
+            # Use a 2D vector for weights (position estimate)
             update = {
                 'weights': robot.mu.copy(),  # In real FL, this would be model parameters
-                'type': robot.robot_type,
+                'type': robot_type_str,
                 'data_size': data_size,
-                'loss': position_error,  # Lower is better
+                'loss': max(position_error, 0.01),  # Lower is better, ensure > 0
                 'observation_quality': observation_quality
             }
             self.robot_updates.append(update)
+        
+        if self.debug_console and len(self.robot_updates) == 0:
+            print(f"[Federated Learning] Warning: No active robots to collect updates from (active: {active_count}/{len(self.robots)})")
     
     def _apply_global_update(self, global_update: np.ndarray, config: Dict):
         """Apply aggregated global update to robots."""
@@ -1560,8 +1611,8 @@ class RobotWebGUI(QMainWindow):
                 if self.debug_console:
                     print(f"[Federated Learning] Auto-initialized GA optimizer")
             
-            # Run federated learning every 50 iterations
-            if self.iter_count % 50 == 0:
+            # Run federated learning more frequently for better visualization (every 20 iterations)
+            if self.iter_count % 20 == 0:
                 self._collect_federated_updates()
                 if len(self.robot_updates) > 0:
                     # Use GA to optimize aggregation
@@ -1629,6 +1680,10 @@ class RobotWebGUI(QMainWindow):
                               f"Selected {len(selected_clients)}/{len(self.robots)} clients")
                     
                     self.federated_round += 1
+                else:
+                    # No robot updates collected - this shouldn't happen but log it
+                    if self.debug_console and self.iter_count % 100 == 0:
+                        print(f"[Federated Learning] Warning: No robot updates collected (iter {self.iter_count})")
         
         # Perform GBP iterations (GPB for robot-to-robot observations)
         if self.iter_count % self.iter_before_motion == 0:
@@ -1912,8 +1967,8 @@ class RobotWebGUI(QMainWindow):
                             self.robot_paths[robot.id].pop(0)
                     
                     self.messages_per_iteration += messages_received
-                    # Calculate GPB error (difference between estimated and ground truth)
-                    gpb_error = np.linalg.norm(robot.mu - robot.gt_pos)
+                    # Calculate GPB error using Mahalanobis distance (accounts for uncertainty)
+                    gpb_error = self._mahalanobis_distance(robot.mu, robot.gt_pos, robot.Lambda)
                     self.last_update_stats[robot.id] = {
                         'messages': messages_received,
                         'position': robot.mu.copy(),
@@ -2777,7 +2832,19 @@ class RobotWebGUI(QMainWindow):
         """Update the federated learning plot in the separate tab with sleek, professional plots."""
         # Always update the plot (even if disabled, to show status)
         if not hasattr(self, 'ax_fl_fitness') or self.ax_fl_fitness is None:
-            return
+            # Try to initialize if not exists
+            if hasattr(self, 'fig_fl') and self.fig_fl is not None:
+                try:
+                    gs_fl = self.fig_fl.add_gridspec(2, 2, hspace=0.35, wspace=0.3, 
+                                                    left=0.08, right=0.95, top=0.93, bottom=0.08)
+                    self.ax_fl_fitness = self.fig_fl.add_subplot(gs_fl[0, 0])
+                    self.ax_fl_weights = self.fig_fl.add_subplot(gs_fl[0, 1])
+                    self.ax_fl_metrics = self.fig_fl.add_subplot(gs_fl[1, 0])
+                    self.ax_fl_clients = self.fig_fl.add_subplot(gs_fl[1, 1])
+                except:
+                    return
+            else:
+                return
         
         if not self.use_federated_learning:
             if hasattr(self, 'fl_status_label'):
@@ -2808,9 +2875,9 @@ class RobotWebGUI(QMainWindow):
         # Update status to show it's enabled
         if hasattr(self, 'fl_status_label'):
             if len(self.federated_fitness_history) == 0:
-                next_round_iter = ((self.iter_count // 50) + 1) * 50
+                next_round_iter = ((self.iter_count // 20) + 1) * 20
                 self.fl_status_label.setText(
-                    f"Enabled | Next round at iteration {next_round_iter} (current: {self.iter_count})"
+                    f"Enabled | Next round at iteration {next_round_iter} (current: {self.iter_count}) | GA: {'Ready' if self.federated_ga is not None else 'Initializing...'}"
                 )
             else:
                 latest_round = self.federated_fitness_history[-1]['round']
@@ -2978,32 +3045,50 @@ class RobotWebGUI(QMainWindow):
                 self.ax_fl_clients.set_title("Client Selection Over Rounds", fontsize=12, fontweight='bold')
         else:
             # No data yet - show message in first subplot
+            next_round_iter = ((self.iter_count // 20) + 1) * 20
+            ga_status = 'Ready' if self.federated_ga is not None else 'Initializing...'
             self.ax_fl_fitness.text(0.5, 0.5, 'Waiting for federated learning data...\n\n'
-                                         f'Federated Learning is enabled.\n'
-                                         f'Next round will run at iteration {((self.iter_count // 50) + 1) * 50}\n'
-                                         f'(Current: {self.iter_count}, runs every 50 iterations)\n\n'
+                                         f'Federated Learning: ENABLED ✓\n'
+                                         f'GA Optimizer: {ga_status}\n'
+                                         f'Next round: iteration {next_round_iter}\n'
+                                         f'Current: {self.iter_count} (runs every 20 iterations)\n\n'
                                          f'The system will collect updates from robots\n'
                                          f'and use GA to optimize aggregation.',
                                      transform=self.ax_fl_fitness.transAxes,
                                      ha='center', va='center', fontsize=11, style='italic',
-                                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+                                     bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
             self.ax_fl_fitness.set_title("Federated Learning (GA-Optimized)", 
                                         fontsize=14, fontweight='bold', pad=15)
             self.ax_fl_fitness.set_xlim(0, 10)
             self.ax_fl_fitness.set_ylim(0, 1)
             
-            # Show empty plots with labels
-            self.ax_fl_weights.set_title("Aggregation Weights", fontsize=12, fontweight='bold')
+            # Show empty plots with labels and proper axes
+            self.ax_fl_weights.set_title("Aggregation Weights (Translation Layer)", fontsize=12, fontweight='bold')
+            self.ax_fl_weights.set_xlabel("Federated Round", fontsize=11, fontweight='bold')
+            self.ax_fl_weights.set_ylabel("Aggregation Weight", fontsize=11, fontweight='bold')
+            self.ax_fl_weights.set_xlim(0, 10)
+            self.ax_fl_weights.set_ylim(0, 1)
+            self.ax_fl_weights.grid(True, alpha=0.3, linestyle='--', linewidth=0.8)
             self.ax_fl_weights.text(0.5, 0.5, 'Waiting for data...', 
                                    transform=self.ax_fl_weights.transAxes,
                                    ha='center', va='center', fontsize=10, style='italic')
             
             self.ax_fl_metrics.set_title("Non-IID Handling Metrics", fontsize=12, fontweight='bold')
+            self.ax_fl_metrics.set_xlabel("Federated Round", fontsize=11, fontweight='bold')
+            self.ax_fl_metrics.set_ylabel("Metric Value", fontsize=11, fontweight='bold')
+            self.ax_fl_metrics.set_xlim(0, 10)
+            self.ax_fl_metrics.set_ylim(0, 1)
+            self.ax_fl_metrics.grid(True, alpha=0.3, linestyle='--', linewidth=0.8)
             self.ax_fl_metrics.text(0.5, 0.5, 'Waiting for data...', 
                                    transform=self.ax_fl_metrics.transAxes,
                                    ha='center', va='center', fontsize=10, style='italic')
             
             self.ax_fl_clients.set_title("Client Selection Over Rounds", fontsize=12, fontweight='bold')
+            self.ax_fl_clients.set_xlabel("Federated Round", fontsize=11, fontweight='bold')
+            self.ax_fl_clients.set_ylabel("Number of Selected Clients", fontsize=11, fontweight='bold')
+            self.ax_fl_clients.set_xlim(0, 10)
+            self.ax_fl_clients.set_ylim(0, len(self.robots) + 0.5)
+            self.ax_fl_clients.grid(True, alpha=0.3, linestyle='--', linewidth=0.8)
             self.ax_fl_clients.text(0.5, 0.5, 'Waiting for data...', 
                                    transform=self.ax_fl_clients.transAxes,
                                    ha='center', va='center', fontsize=10, style='italic')
